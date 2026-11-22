@@ -182,6 +182,27 @@ inherited "LAS Recomp" ones included (message boxes, the crash dialog, the CPU c
   `--game=` (same as `--base=`) and each option as two arguments (`--keys <prod.keys>`). Without these options
   nothing changed. README: the "Get it on RecompLauncher" badge.
 
+## ARMS 5.5.1 as well as 5.4.0 (2026-11-22)
+
+The 5.5.1 update (title version 1245184) has a new `main` (build ID BBA3811191DE71D9B55E53F918AE5DC1, 11,927,896
+bytes) and a new RomFS; `sdk`, `rtld` and `subsdk0` are byte for byte 5.4.0's, so the HLE symbols and the SDK side
+of the runtime apply unchanged. The runtime reads no game addresses (`GameAddrs` is empty), so 5.5.1 needed no
+address table of its own.
+
+- `runtime/game_addresses.c`: 5.5.1 in `versions[]`; the log says `[game] version 5.5.1`.
+- The release's setup accepts either update (`nsp_extract.py --build 501924b7c22129e5,bba3811191de71d9`: `--build`
+  takes several prefixes); the launcher, `recomplauncher.json`, the crash dialog and the README name both.
+- `runtime/nvn/shader_variants.txt`: +42 records seen only in 5.5.1 (1912). On 5.5.1, 1905 of them are prepared
+  before the game shows and a replayed Fight builds nothing new; on 5.4.0 the records it doesn't have are skipped.
+- Tested on 5.5.1 with the scripted routes (`LARECOMP_HOST_INPUT`): Grand Prix, every Versus mode, Party Match,
+  Ranked, Friends, Local, Training and Badges - no exceptions, 60 fps (2 s windows at 46 fps or more in play,
+  as on 5.4.0), the same menus, so the same routes work. The release's setup ran with each update in turn in one
+  folder (the game code is rebuilt for the update given).
+- **`armsrecomp.exe` opened before setup** (a player's report: "FATAL: the game files' exefs/main is missing or
+  unreadable" in an unzipped release where setup never ran): with no arguments and no game set up (no
+  `extracted/exefs/main` or no `armsgame.dll`), it starts `armslauncher.exe` next to it instead, waits for it and exits
+  with its code. Without a launcher there, the crash dialog says "ARMS Rearmed isn't set up yet" and what to do.
+
 What this project changed relative to [LAS Recomp](https://github.com/peiikai/LASRecomp) (its recompiler and Switch
 runtime), why, and where. It also lists the debugging switches, the test routes, the known gaps and the next steps.
 It started as DOAX3 Recomp (the sections from "Project setup" to "Test routes" are that work, which MUA3 inherits:

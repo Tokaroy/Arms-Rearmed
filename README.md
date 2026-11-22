@@ -2,7 +2,7 @@
 
 <a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
-A static recompilation of *ARMS* (Nintendo Switch, version 5.4.0: the base game with its last update) into a native
+A static recompilation of *ARMS* (Nintendo Switch, version 5.5.1 or 5.4.0: the base game with one of those updates) into a native
 Windows x86-64 program, built on [LAS Recomp](https://github.com/peiikai/LASRecomp)'s recompiler and Switch runtime
 (by way of MUA3 Recomp and DOAX3 Recomp). The game's ARM64 code is translated to C and compiled for the PC; a Switch
 runtime takes the console's place (graphics through Vulkan, audio, input, files, services).
@@ -15,7 +15,7 @@ starts and no model shows up late. Online play, local wireless, the web manual a
 game says so and stays in its menus. Details: [docs/CHANGES.md](docs/CHANGES.md).
 
 No game files are included or ever committed, and the releases hold no game code: the game code is recompiled from
-your own copy on your own PC. You need your own legally obtained copy of the game, its 5.4.0 update and the keys from
+your own copy on your own PC. You need your own legally obtained copy of the game, its 5.5.1 or 5.4.0 update and the keys from
 your own console.
 
 ![ARMS Rearmed's icon (original art, no game assets)](docs/icon/icon.png)
@@ -23,7 +23,7 @@ your own console.
 ## Play with RecompLauncher
 
 ARMS Rearmed works with [RecompLauncher](https://recomplauncher.com): install it from the launcher, then give Easy
-Setup your ARMS XCI or NSP, the 5.4.0 update NSP and your `prod.keys`. The setup step recompiles the game for your PC
+Setup your ARMS XCI or NSP, its update NSP (5.5.1 or 5.4.0) and your `prod.keys`. The setup step recompiles the game for your PC
 (about 10 minutes; nothing else to install), then Play starts it. Video, sound and controller settings are on the
 game's page. Keep your XCI / NSP files where they are: the game reads its data from them.
 
@@ -31,8 +31,8 @@ game's page. Keep your XCI / NSP files where they are: the game reads its data f
 
 1. Download `ARMS-Rearmed-v<version>-Windows-x64.zip` from [Releases](https://github.com/VirtuaQuest/Arms-Rearmed/releases)
    and unzip it somewhere you can write to (Documents or Desktop, not Program Files).
-2. Run `armslauncher.exe`. On **GAME FILES**, choose your base game (XCI or NSP), the 5.4.0 update (NSP) and your
-   `prod.keys`, then **INSTALL** (about 10 minutes the first time: extract, recompile, build, prepare the shaders).
+2. Run `armslauncher.exe`. On **GAME FILES**, choose your base game (XCI or NSP), its update (NSP: 5.5.1 or
+   5.4.0) and your `prod.keys`, then **INSTALL** (about 10 minutes the first time: extract, recompile, build, prepare the shaders).
 3. **FIGHT!** on the PLAY page.
 
 Needs Windows 10 or 11 (64-bit), a CPU with AVX2 (Intel 4th gen / AMD Ryzen or newer), a graphics driver with Vulkan
@@ -48,8 +48,8 @@ Needs Windows 10 or 11 (64-bit), a CPU with AVX2 (Intel 4th gen / AMD Ryzen or n
 3. Build the launcher once, from Git Bash or the MSYS2 UCRT64 shell in this folder:
    `export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"; make launcher dlls` (`dlls` copies the MSYS2 DLLs
    next to it, so it starts from Explorer).
-4. Run `build\armslauncher.exe`. On **GAME FILES**, choose your base game (XCI or NSP), the 5.4.0 update (NSP) and
-   your `prod.keys`, then **INSTALL**: it makes the Python environment, extracts the game's code, recompiles it and
+4. Run `build\armslauncher.exe`. On **GAME FILES**, choose your base game (XCI or NSP), its update (NSP: 5.5.1 or
+   5.4.0) and your `prod.keys`, then **INSTALL**: it makes the Python environment, extracts the game's code, recompiles it and
    builds the PC version (about 10 minutes the first time). Then **FIGHT!** on the PLAY page.
 
 Only the game's code (exefs) and control data are copied out; the game data is read in place from your files through
