@@ -203,6 +203,35 @@ address table of its own.
   `extracted/exefs/main` or no `armsgame.dll`), it starts `armslauncher.exe` next to it instead, waits for it and exits
   with its code. Without a launcher there, the crash dialog says "ARMS Rearmed isn't set up yet" and what to do.
 
+## 2 to 4 players, Skip the title screen (2026-11-22, a player's report)
+
+- **2P / 3P / 4P froze** (Versus, the tutorial "for 2 players"; the music played on, the menu opened): the game
+  opens the console's "connect controllers" screen, `nn::hid::ShowControllerSupport`, and waited for it forever.
+  `runtime/hle/applets.c` answers it at once from the connected controllers (`input_setup_players`): a controller
+  each (player 1 keeps the keyboard), or with one short the keyboard as player 1. Too few: a notice says how many
+  to connect and the game is told the screen was cancelled (`nn::hid::ResultControllerSupportCanceled`), so it
+  stays in its menu.
+- **Players 2-4** (`runtime/hle/input.c`, `runtime/players.h`): the runtime had player 1 only. Each player has
+  their own controller (Npad No2-No4: FullKey style, state, rumble through the same bindings and settings); the
+  controller that plays doesn't switch on a press while several play; a disconnected one is said on screen.
+  Controllers with a player light show the number (`SDL_SetGamepadPlayerIndex`). `rumble.h`: handles for players
+  2-4.
+- **Controls tab, Players** (`runtime/ui/controls_ui.mm`): who plays with what; selecting a player gives them the
+  next controller (swapping with whoever had it), Identify controllers vibrates each one. Tested with
+  `LARECOMP_TEST_PADS=<n>` (pretend controllers, `p2:<button>` in `LARECOMP_HOST_INPUT`): 2P Versus through
+  character select to a split-screen fight with both players punching, 4P set up, 3P with one controller
+  refused with the game back on its menu.
+- **Skip the title screen** (`skip_title`, off by default: launcher PLAY page, Video tab, RecompLauncher): L + R
+  held from the start, as a player holding them would - the title takes them, the menus act on presses only. The
+  safety screen before it is timed by the game and stays. The player's first press, or 30 s, ends the hold.
+  The Video tab's Link's Awakening rows (Remove blur, Hide Hero Mode icon) are gone.
+- **The menu from a controller**: Back + Start together (and Home / Guide) already opened it; the README says so now.
+- **A picture dark except its top-left quarter after minimising** (4K, borderless, Match display, SMAA; reported
+  with screenshots) did not happen here: minimise / restore at 1x, 2x and in a 3840x2160 window, with and without
+  SMAA, and window size changes in fights, character select and Training all drew correctly. The log now has
+  `[window]` lines (minimised, restored, sizes) and one line for a stretch of failed acquires instead of one per frame;
+  test scripts can `window:minimize` / `window:restore`.
+
 What this project changed relative to [LAS Recomp](https://github.com/peiikai/LASRecomp) (its recompiler and Switch
 runtime), why, and where. It also lists the debugging switches, the test routes, the known gaps and the next steps.
 It started as DOAX3 Recomp (the sections from "Project setup" to "Test routes" are that work, which MUA3 inherits:

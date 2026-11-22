@@ -78,12 +78,21 @@ tools/run.sh                              # or build/armsrecomp.exe extracted (l
 | Guard | Left Ctrl | Left stick press |
 | Rush | Q or E | L or R |
 | Pause (+) / (-) | Tab / M | Start / Back |
-| Menu (controls, video, audio) | Esc or F1 | Home / Guide |
+| Menu (controls, video, audio) | Esc or F1 | Home / Guide, or Back + Start together |
 
 Everything can be rebound in game (Esc or F1, then Controls): keys, mouse buttons and controller buttons. Any
 controller SDL 3 knows works (Xbox, PlayStation, Switch Pro, and more), with rumble. The launcher's GRAPHICS page
 (and the in-game Video tab) set the window mode and size, the internal resolution (up to 4x, or dynamic), FSR 1
 upscaling, SMAA and the aspect ratio. ARMS runs at its own 60 fps: its fights step once a frame.
+
+**2 to 4 players.** Choose 2P, 3P or 4P in the game (Versus, Grand Prix, the tutorial) and each player gets a
+controller of their own, in the order the controllers were connected; player 1 also plays with the keyboard. One
+controller short, the keyboard is player 1 and the controllers are players 2 on. Controllers that show a player
+number light it. The in-game menu's Controls tab lists who plays with what under **Players**: select a player to
+give them the next controller (it swaps with whoever had it), and **Identify controllers** makes each one vibrate.
+
+**Skip the title screen** (launcher PLAY page, or the in-game Video tab): straight to the main menu after the safety
+screen at start, without pressing L + R.
 
 ## Making a release
 
