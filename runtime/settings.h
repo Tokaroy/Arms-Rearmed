@@ -39,6 +39,7 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
+    bool skip_title;     // straight past the title screen to the main menu (runtime/hle/input.c holds L + R for it)
     int frame_rate;      // 30, 60 or 120 fps: the display period and the game's time step follow it (runtime/hle/vi.c)
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     bool rumble;         // controller vibration from the game (runtime/hle/input.c)

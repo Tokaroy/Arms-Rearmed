@@ -11,6 +11,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"  // (SetFocusID, NavCursorVisible)
 #include "option_rows.h"
+#include "../players.h"
 
 extern "C" {
 #include "../input_bind.h"
@@ -262,6 +263,28 @@ extern "C" void controls_tab_draw(float scale) {
                    "Controllers keep working while another window is in front. macOS may ask for Input Monitoring "
                    "permission."))
         input_apply_background();
+
+    // Players: who plays with what. The game sets up 2 to 4 players when they're chosen (each gets a controller of
+    // their own: runtime/hle/input.c); here they can be put in another order, and each controller found.
+    opt_section("Players");
+    {
+        int n = input_players();
+        char dev[128], label[24];
+        for (int p = 0; p < (n > 1 ? n : 1); p++) {
+            snprintf(label, sizeof label, "Player %d", p + 1);
+            input_player_device(p, dev, sizeof dev);
+            if (opt_action(label, dev,
+                           n > 1 ? "Give this player the next controller: it swaps with the player who has it. Player 1 "
+                                   "also plays with the keyboard, or with the keyboard alone."
+                                 : "Play with the next connected controller. Choose 2 to 4 players in the game and each "
+                                   "player gets a controller of their own, in the order they were connected.",
+                           true, false))
+                input_player_next(p);
+        }
+        if (opt_button("Identify controllers", "Each player's controller vibrates (longer for each later player) and "
+                                               "the bottom of the screen shows who is who."))
+            input_players_identify();
+    }
 
     opt_section("Controller");
     opt_toggle("Rumble", &g_settings.rumble, true, "Controller vibration.");

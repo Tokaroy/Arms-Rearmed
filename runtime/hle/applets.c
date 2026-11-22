@@ -11,6 +11,27 @@ HLE_FUNC("_ZN2nn3hid24ShowControllerStrapGuideEv", applet_strap_guide) {
     c->x[0] = 0;
 }
 
+// nn::Result nn::hid::ShowControllerSupport(ControllerSupportResultInfo*, const ControllerSupportArg&): the console's
+// "connect controllers" screen, which ARMS opens when 2 to 4 players are chosen (Versus, the tutorial for two). It
+// returned never (the game waited with its music playing): the players are set up from the connected controllers at
+// once (runtime/hle/input.c input_setup_players). Arg: s8 player_count_min, s8 player_count_max, then flags; result
+// info: s8 player_count, 3 bytes, u32 selected NpadIdType.
+#include "../players.h"
+HLE_FUNC("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
+         applet_controller_support) {
+    uint8_t *info = (uint8_t *)(uintptr_t)c->x[0];
+    const int8_t *arg = (const int8_t *)(uintptr_t)c->x[1];
+    int min = arg[0], max = arg[1], n = 0;
+    LOG("[applet] controller support: %d to %d players (flags %02x %02x %02x %02x %02x)\n", min, max,
+        (uint8_t)arg[2], (uint8_t)arg[3], (uint8_t)arg[4], (uint8_t)arg[5], (uint8_t)arg[6]);
+    if (input_setup_players(min, max, &n)) {
+        if (info) memset(info, 0, 8), info[0] = (uint8_t)n;  // (selected id: No1)
+        c->x[0] = 0;
+    } else {
+        c->x[0] = 202 | 3101u << 9;  // nn::hid::ResultControllerSupportCanceled: as if the player backed out of it
+    }
+}
+
 // void nn::err::ShowError(nn::err::ErrorCode)  (ErrorCode {u32 category, u32 number} in x0)
 HLE_FUNC("_ZN2nn3err9ShowErrorENS0_9ErrorCodeE", applet_show_error_code) {
     LOG("[applet] error dialog: %04u-%04u (skipped)\n", (unsigned)(c->x[0] & 0xFFFFFFFF), (unsigned)(c->x[0] >> 32));

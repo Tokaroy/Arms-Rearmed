@@ -732,7 +732,12 @@ bool vk_frame_begin(const float clear[4]) {
         WAITING_AT(1, r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE,
                                           &cur_frame.image));
     }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
+    static int failing;  // (a minimised window fails every frame: one line when it starts, one when it ends)
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        if (!failing++) LOG("[vk] acquire failed: %d (no window image: minimised?)\n", r);
+        return false;
+    }
+    if (failing) { LOG("[vk] window images again after %d failed acquires\n", failing); failing = 0; }
     cur_frame.acquired = acquire_sem[slot];
     cur_frame.id++;
     cur_frame.secondary = false;
@@ -1371,6 +1376,21 @@ int ui_run(void) {
                 LOG("window closed\n");
                 backend_quit();  // (before exit(): see there)
                 exit(0);
+            }
+            // the window's own changes, for the log (a player's report of a picture broken after minimising: which sizes
+            // the window went through)
+            if (e.type == SDL_EVENT_WINDOW_MINIMIZED || e.type == SDL_EVENT_WINDOW_RESTORED ||
+                e.type == SDL_EVENT_WINDOW_MAXIMIZED || e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+                e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN || e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN ||
+                e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) {
+                static int nwin;
+                int pw = 0, ph = 0;
+                SDL_GetWindowSizeInPixels(window, &pw, &ph);
+                const char *what = e.type == SDL_EVENT_WINDOW_MINIMIZED ? "minimised" : e.type == SDL_EVENT_WINDOW_RESTORED ? "restored"
+                                 : e.type == SDL_EVENT_WINDOW_MAXIMIZED ? "maximised" : e.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ? "fullscreen"
+                                 : e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN ? "left fullscreen"
+                                 : e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED ? "on another display" : "pixel size changed";
+                if (nwin++ < 400) LOG("[window] %s: %dx%d pixels\n", what, pw, ph);
             }
             extern bool input_user_blocked(const SDL_Event *e);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing (as metal.m)

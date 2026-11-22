@@ -33,40 +33,73 @@ static SDL_Gamepad *pad;
 static _Atomic int64_t sampling;
 static bool host_test;  // scripted runs must not vibrate the user's controller
 
+// ---- players 2 to 4 (runtime/players.h). Player 1 is the keyboard plus `pad`, as in single player. When the game
+// sets up more players (input_setup_players) each gets a controller of their own: slot_pad[k] for player k + 1 (slot 0:
+// player 1's controller, 0 for the keyboard alone). Their buttons go through the same controller bindings.
+#include "../players.h"
+#define TEST_PAD_BASE 0x7E5800u  // LARECOMP_TEST_PADS=<n>: pretend controllers for scripted runs ("p2:<button>" etc.)
+static pthread_mutex_t players_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDL_JoystickID conn_order[16];  // connected controllers, oldest first (players_lock)
+static int n_conn;
+static int test_pads = -1;
+static _Atomic int g_players = 1;
+static _Atomic SDL_JoystickID slot_pad[INPUT_MAX_PLAYERS];
+static _Atomic uint64_t slot_buttons[INPUT_MAX_PLAYERS];
+static _Atomic int32_t slot_lx[INPUT_MAX_PLAYERS], slot_ly[INPUT_MAX_PLAYERS], slot_rx[INPUT_MAX_PLAYERS], slot_ry[INPUT_MAX_PLAYERS];
+static _Atomic uint32_t test_slot_host[INPUT_MAX_PLAYERS];  // the pretend controllers' buttons (host bits)
+static _Atomic SDL_JoystickID pad_id;  // `pad`'s id, for the game thread
+static _Atomic int players_apply_req, player_next_req, identify_req;  // UI thread work (players_poll)
+static bool is_test_pad(SDL_JoystickID id) { return id >= TEST_PAD_BASE && id < TEST_PAD_BASE + 16; }
+// a player 2-4 slot that has this controller (0: none)
+static int slot_of(SDL_JoystickID id) {
+    int n = g_players;
+    for (int k = 1; k < n && k < INPUT_MAX_PLAYERS; k++)
+        if (id && slot_pad[k] == id) return k;
+    return 0;
+}
+static bool p1_keyboard_only(void) { return g_players > 1 && !slot_pad[0]; }
+
 // Guest IPC threads publish values; only the UI thread touches SDL's pad.
 // The lock also makes paired value snapshots consistent with permission/reset.
 static SDL_SpinLock rumble_lock;
 static RumbleValue rumble_values[2];
+static RumbleValue rumble_slot_values[INPUT_MAX_PLAYERS][2];  // players 2-4 ([1]..[3])
 static bool rumble_allowed = true;
 static _Atomic uint64_t rumble_frame_ms;
 static uint16_t rumble_last_lo, rumble_last_hi;
 static uint64_t rumble_last_ms;
+static uint16_t slot_last_lo[INPUT_MAX_PLAYERS], slot_last_hi[INPUT_MAX_PLAYERS];
+static uint64_t slot_last_ms[INPUT_MAX_PLAYERS];
 static bool rumble_warned;
 
 static void rumble_clear(void) {
     SDL_LockSpinlock(&rumble_lock);
     memset(rumble_values, 0, sizeof rumble_values);
+    memset(rumble_slot_values, 0, sizeof rumble_slot_values);
     SDL_UnlockSpinlock(&rumble_lock);
 }
 void input_rumble_send(uint32_t h, const RumbleValue *v) {
-    int side = rumble_side(h);
+    int side = rumble_side(h), p = rumble_player(h);
     SDL_LockSpinlock(&rumble_lock);
     if (side < 0) { SDL_UnlockSpinlock(&rumble_lock); return; }
-    if (rumble_allowed) rumble_values[side] = *v;
+    if (rumble_allowed) {
+        if (p == 0) rumble_values[side] = *v;
+        else rumble_slot_values[p][side] = *v;
+    }
     SDL_UnlockSpinlock(&rumble_lock);
 }
 RumbleValue input_rumble_get(uint32_t h) {
     RumbleValue v = {0, 160, 0, 320};
-    int side = rumble_side(h);
+    int side = rumble_side(h), p = rumble_player(h);
     SDL_LockSpinlock(&rumble_lock);
-    if (side >= 0 && rumble_allowed) v = rumble_values[side];
+    if (side >= 0 && rumble_allowed) v = p == 0 ? rumble_values[side] : rumble_slot_values[p][side];
     SDL_UnlockSpinlock(&rumble_lock);
     return v;  // requested value, not physical motor feedback
 }
 void input_rumble_permit(bool allowed) {
     SDL_LockSpinlock(&rumble_lock);
     rumble_allowed = allowed;
-    if (!allowed) memset(rumble_values, 0, sizeof rumble_values);
+    if (!allowed) memset(rumble_values, 0, sizeof rumble_values), memset(rumble_slot_values, 0, sizeof rumble_slot_values);
     SDL_UnlockSpinlock(&rumble_lock);
 }
 bool input_rumble_permitted(void) {
@@ -75,9 +108,30 @@ bool input_rumble_permitted(void) {
     SDL_UnlockSpinlock(&rumble_lock);
     return allowed;
 }
+static void players_poll(void);
 void input_rumble_poll(void) {
+    players_poll();
     uint64_t now = SDL_GetTicks();
     uint64_t last_frame = atomic_load(&rumble_frame_ms);
+    for (int k = 1; k < INPUT_MAX_PLAYERS; k++) {  // players 2-4: their own controllers, the same rules as player 1's
+        SDL_Gamepad *g = k < g_players && slot_pad[k] && !is_test_pad(slot_pad[k]) ? SDL_GetGamepadFromID(slot_pad[k]) : NULL;
+        uint16_t lo = 0, hi = 0;
+        bool off = (now > last_frame && now - last_frame > 250) || !g || host_test || !g_settings.rumble || menu_is_open() ||
+                   !SDL_GetKeyboardFocus();
+        SDL_LockSpinlock(&rumble_lock);
+        if (off) memset(rumble_slot_values[k], 0, sizeof rumble_slot_values[k]);
+        else if (rumble_allowed) {
+            rumble_mix(rumble_slot_values[k], &lo, &hi);
+            int pct = g_settings.rumble_strength;
+            if (pct > 0 && pct < 100) lo = (uint16_t)(lo * pct / 100), hi = (uint16_t)(hi * pct / 100);
+        }
+        SDL_UnlockSpinlock(&rumble_lock);
+        if (g && (lo != slot_last_lo[k] || hi != slot_last_hi[k] || ((lo || hi) && now - slot_last_ms[k] >= 100))) {
+            SDL_RumbleGamepad(g, lo, hi, (lo || hi) ? 250 : 0);
+            slot_last_ms[k] = now;
+        }
+        slot_last_lo[k] = lo, slot_last_hi[k] = hi;
+    }
     uint16_t lo = 0, hi = 0;
     // Switch values are latched until changed: they contain no duration.
     // Renew SDL's 250 ms effect every 100 ms while frames are progressing.
@@ -216,6 +270,30 @@ static void recompute_pad(void) {
     pad_ly = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
     pad_rx = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX);
     pad_ry = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY);
+}
+
+// Player k + 1's controller (k >= 1) -> its Switch buttons and sticks, through the same controller bindings.
+static void recompute_slot(int k) {
+    SDL_JoystickID id = slot_pad[k];
+    uint32_t host = 0;
+    int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+    if (is_test_pad(id)) host = test_slot_host[k];
+    else if (id && !host_test) {
+        SDL_Gamepad *g = SDL_GetGamepadFromID(id);
+        if (g) {
+            for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; i++)
+                if (SDL_GetGamepadButton(g, (SDL_GamepadButton)i)) host |= 1u << i;
+            if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) host |= 1u << PADB_LTRIGGER;
+            if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) host |= 1u << PADB_RTRIGGER;
+            lx = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX), ly = -SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY);
+            rx = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX), ry = -SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY);
+        }
+    }
+    uint64_t b = 0;
+    for (int i = 0; i < BIND_PAD_COUNT; i++)
+        if (g_bind_pad[i] >= 0 && g_bind_pad[i] < PADB_HOST_COUNT && (host >> g_bind_pad[i] & 1)) b |= 1ull << i;
+    slot_buttons[k] = b;
+    slot_lx[k] = lx, slot_ly[k] = ly, slot_rx[k] = rx, slot_ry[k] = ry;
 }
 
 // Every press reaches the game, however short. recompute_pad reads the pad as it is now, so a quick tap whose press
@@ -404,13 +482,210 @@ static void use_pad(SDL_JoystickID id, const char *why) {
         rumble_last_lo = rumble_last_hi = 0, rumble_warned = false;  // (the next poll starts it on the new one)
     }
     pad = g;
+    pad_id = id;
     LOG("[input] gamepad: %s%s\n", SDL_GetGamepadName(pad), why);
     note_family();
     recompute_pad();
 }
+static void drop_p1_pad(void) {  // player 1 plays with the keyboard alone (players set up that way)
+    if (!pad) return;
+    led_restore("controller changed");
+    SDL_RumbleGamepad(pad, 0, 0, 0);
+    rumble_last_lo = rumble_last_hi = 0, rumble_warned = false;
+    pad = NULL, pad_id = 0;
+    recompute_pad();
+}
 static void open_pad(SDL_JoystickID id) {
     if (!SDL_GetGamepadFromID(id)) SDL_OpenGamepad(id);
-    if (!pad) use_pad(id, "");
+    pthread_mutex_lock(&players_lock);
+    bool known = false;
+    for (int i = 0; i < n_conn; i++) known |= conn_order[i] == id;
+    if (!known && n_conn < 16) conn_order[n_conn++] = id;
+    pthread_mutex_unlock(&players_lock);
+    if (!pad && g_players == 1) use_pad(id, "");  // (more players: a new controller waits to be picked - Controls tab)
+}
+
+// ---- players 2 to 4 (runtime/players.h)
+static const char *pad_name(SDL_JoystickID id, char *buf, size_t cap) {
+    if (is_test_pad(id)) { snprintf(buf, cap, "Test controller %u", (unsigned)(id - TEST_PAD_BASE) + 1); return buf; }
+    const char *n = id ? SDL_GetGamepadNameForID(id) : NULL;
+    snprintf(buf, cap, "%s", n && *n ? n : "Controller");
+    return buf;
+}
+static int connected_pads(SDL_JoystickID *out, int cap) {  // (players_lock held)
+    int n = 0;
+    for (int i = 0; i < n_conn && n < cap; i++) out[n++] = conn_order[i];
+    if (test_pads < 0) test_pads = getenv("LARECOMP_TEST_PADS") ? atoi(getenv("LARECOMP_TEST_PADS")) : 0;
+    for (int i = 0; i < test_pads && i < 16 && n < cap; i++) out[n++] = TEST_PAD_BASE + (SDL_JoystickID)i;
+    return n;
+}
+static bool in_list(const SDL_JoystickID *l, int n, SDL_JoystickID id) {
+    for (int i = 0; i < n; i++) if (l[i] == id) return true;
+    return false;
+}
+int input_controllers(void) {
+    SDL_JoystickID ids[32];
+    pthread_mutex_lock(&players_lock);
+    int n = connected_pads(ids, 32);
+    pthread_mutex_unlock(&players_lock);
+    return n;
+}
+int input_players(void) { return g_players; }
+void input_player_device(int p, char *out, size_t cap) {
+    char nm[128];
+    out[0] = 0;
+    if (p < 0 || p >= INPUT_MAX_PLAYERS) return;
+    if (p == 0) {
+        SDL_JoystickID id = g_players > 1 ? slot_pad[0] : pad_id;
+        if (id) snprintf(out, cap, "Keyboard + %s", pad_name(id, nm, sizeof nm));
+        else snprintf(out, cap, "Keyboard");
+    } else if (p < g_players) {
+        snprintf(out, cap, "%s", slot_pad[p] ? pad_name(slot_pad[p], nm, sizeof nm) : "No controller");
+    }
+}
+static void players_notice(void) {
+    char msg[256] = "", dev[128];
+    int n = g_players;
+    for (int p = 0; p < n; p++) {
+        input_player_device(p, dev, sizeof dev);
+        size_t l = strlen(msg);
+        snprintf(msg + l, sizeof msg - l, "%sP%d: %s", p ? "   " : "", p + 1, dev);
+    }
+    menu_notice(msg, 6);
+    LOG("[input] players: %s\n", msg);
+}
+
+bool input_setup_players(int min, int max, int *count) {
+    if (max < 1 || max > INPUT_MAX_PLAYERS) max = INPUT_MAX_PLAYERS;
+    if (min < 1) min = 1;
+    if (min > max) min = max;
+    SDL_JoystickID all[32], order[32];
+    pthread_mutex_lock(&players_lock);
+    int na = connected_pads(all, 32), n = 0;
+    // the arrangement so far (the Players rows) first, then player 1's controller, then the rest as connected
+    if (g_players > 1)
+        for (int k = 0; k < g_players; k++)
+            if (slot_pad[k] && in_list(all, na, slot_pad[k]) && !in_list(order, n, slot_pad[k])) order[n++] = slot_pad[k];
+    if (pad_id && in_list(all, na, pad_id) && !in_list(order, n, pad_id)) order[n++] = pad_id;
+    for (int i = 0; i < na; i++) if (!in_list(order, n, all[i])) order[n++] = all[i];
+    SDL_JoystickID slots[INPUT_MAX_PLAYERS] = {0};
+    int players;
+    if (n >= min) {  // a controller each (player 1 keeps the keyboard too)
+        players = n < max ? n : max;
+        for (int k = 0; k < players; k++) slots[k] = order[k];
+    } else if (n + 1 >= min) {  // one short: the keyboard is player 1, the controllers players 2 on
+        players = n + 1 < max ? n + 1 : max;
+        for (int k = 1; k < players; k++) slots[k] = order[k - 1];
+    } else {
+        pthread_mutex_unlock(&players_lock);
+        char msg[200];
+        snprintf(msg, sizeof msg, "%d players need %d controllers (or %d and the keyboard): %d connected. Connect more, "
+                 "then choose again.", min, min, min - 1, n);
+        menu_notice(msg, 8);
+        LOG("[input] players: %d to %d wanted, %d controllers: not enough\n", min, max, n);
+        return false;
+    }
+    for (int k = 0; k < INPUT_MAX_PLAYERS; k++) {
+        slot_pad[k] = k < players ? slots[k] : 0;
+        slot_buttons[k] = 0, slot_lx[k] = slot_ly[k] = slot_rx[k] = slot_ry[k] = 0;
+    }
+    g_players = players;
+    pthread_mutex_unlock(&players_lock);
+    players_apply_req = 1;  // (player 1's controller and the player lights: the UI thread)
+    if (players > 1) players_notice();
+    else LOG("[input] players: 1\n");
+    *count = players;
+    return true;
+}
+
+void input_player_next(int p) { if (p >= 0 && p < INPUT_MAX_PLAYERS) player_next_req = p + 1; }
+void input_players_identify(void) { identify_req = 1; }
+
+// UI thread (input_rumble_poll): the requests above
+static void players_poll(void) {
+    int p = atomic_exchange(&player_next_req, 0) - 1;
+    if (p >= 0) {  // player p's next controller: the keyboard alone (player 1 with more players), then each one connected
+        SDL_JoystickID all[32], cand[33];
+        pthread_mutex_lock(&players_lock);
+        int na = connected_pads(all, 32), nc = 0;
+        int n = g_players;
+        if (p == 0 && n > 1) cand[nc++] = 0;
+        for (int i = 0; i < na; i++) cand[nc++] = all[i];
+        SDL_JoystickID cur = n > 1 ? slot_pad[p] : pad_id;
+        int at = -1;
+        for (int i = 0; i < nc; i++) if (cand[i] == cur) at = i;
+        for (int step = 1; step <= nc && nc; step++) {
+            SDL_JoystickID next = cand[(at + step + nc) % nc];
+            if (next == cur) break;
+            if (n == 1) {  // single player: which controller plays
+                pthread_mutex_unlock(&players_lock);
+                if (!is_test_pad(next)) use_pad(next, " (picked in the menu)");
+                pthread_mutex_lock(&players_lock);
+                break;
+            }
+            int other = -1;
+            for (int k = 0; k < n; k++) if (k != p && next && slot_pad[k] == next) other = k;
+            if (other > 0 && !cur) continue;  // (a player after the first can't be left with the keyboard alone)
+            if (other >= 0) slot_pad[other] = cur;
+            slot_pad[p] = next;
+            for (int k = 1; k < n; k++) recompute_slot(k);
+            players_apply_req = 1;
+            break;
+        }
+        pthread_mutex_unlock(&players_lock);
+        if (g_players > 1) players_notice();
+    }
+    if (atomic_exchange(&players_apply_req, 0)) {
+        int n = g_players;
+        if (n > 1) {
+            if (!slot_pad[0]) drop_p1_pad();
+            else if (!is_test_pad(slot_pad[0])) use_pad(slot_pad[0], " (player 1)");
+        }
+        // each player's number on controllers that show one (Switch Pro, DualSense...); others: none while several play
+        pthread_mutex_lock(&players_lock);
+        for (int i = 0; i < n_conn; i++) {
+            SDL_Gamepad *g = SDL_GetGamepadFromID(conn_order[i]);
+            if (!g) continue;
+            int idx = -1;
+            for (int k = 0; k < n; k++) if (n > 1 && slot_pad[k] == conn_order[i]) idx = k;
+            if (n == 1) idx = conn_order[i] == pad_id ? 0 : -1;
+            SDL_SetGamepadPlayerIndex(g, idx);
+        }
+        pthread_mutex_unlock(&players_lock);
+    }
+    if (atomic_exchange(&identify_req, 0)) {
+        int n = g_players;
+        for (int k = 0; k < n; k++) {
+            SDL_JoystickID id = n > 1 ? slot_pad[k] : pad_id;
+            SDL_Gamepad *g = id && !is_test_pad(id) ? SDL_GetGamepadFromID(id) : NULL;
+            if (g) SDL_RumbleGamepad(g, 0x7000, 0x7000, 300 + 250 * (Uint32)k);  // (longer for each later player)
+        }
+        if (n > 1) players_notice();
+        else {
+            char dev[128], msg[160];
+            input_player_device(0, dev, sizeof dev);
+            snprintf(msg, sizeof msg, "One player: %s", dev);
+            menu_notice(msg, 5);
+        }
+    }
+}
+// A controller went away: a player who had it has none until one is picked (or the game sets players up again)
+static void players_pad_removed(SDL_JoystickID id) {
+    pthread_mutex_lock(&players_lock);
+    for (int i = 0; i < n_conn; i++)
+        if (conn_order[i] == id) { memmove(conn_order + i, conn_order + i + 1, (size_t)(n_conn - i - 1) * sizeof *conn_order); n_conn--; break; }
+    int n = g_players, lost = -1;
+    for (int k = 0; k < n && n > 1; k++)
+        if (slot_pad[k] == id) slot_pad[k] = 0, lost = k;
+    pthread_mutex_unlock(&players_lock);
+    if (lost >= 0) {
+        if (lost > 0) recompute_slot(lost);
+        char msg[160];
+        snprintf(msg, sizeof msg, "Player %d's controller was disconnected. Connect one, then pick it in the menu "
+                 "(Controls, Players).", lost + 1);
+        menu_notice(msg, 8);
+        LOG("[input] %s\n", msg);
+    }
 }
 
 void input_handle_event(const SDL_Event *e) {
@@ -446,14 +721,15 @@ void input_handle_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_GAMEPAD_REMOVED: {
         SDL_Gamepad *g = SDL_GetGamepadFromID(e->gdevice.which);
+        players_pad_removed(e->gdevice.which);
         if (g && g == pad) {
             SDL_RumbleGamepad(pad, 0, 0, 0);
-            pad = NULL;
+            pad = NULL, pad_id = 0;
             led_forget();  // (gone: it shows its own colour when it comes back)
             rumble_clear(); rumble_last_lo = rumble_last_hi = 0; rumble_warned = false;
         }
         if (g) SDL_CloseGamepad(g);
-        if (!pad) {  // another one still connected takes over
+        if (!pad && g_players == 1) {  // another one still connected takes over (more players: theirs stay theirs)
             int n = 0;
             SDL_JoystickID *ids = SDL_GetGamepads(&n);
             for (int i = 0; ids && i < n && !pad; i++)
@@ -465,7 +741,12 @@ void input_handle_event(const SDL_Event *e) {
         break;
     }
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        if (e->gbutton.down && e->gbutton.which != TEST_DEVICE && !host_test) use_pad(e->gbutton.which, " (switched)");
+        if (g_players > 1 && e->gbutton.which != TEST_DEVICE) {  // several players: each controller is its player's
+            int k = slot_of(e->gbutton.which);
+            if (k) recompute_slot(k);
+            if (k || e->gbutton.which != pad_id) break;  // (player 2-4's, or nobody's)
+        }
+        if (e->gbutton.down && e->gbutton.which != TEST_DEVICE && !host_test && g_players == 1) use_pad(e->gbutton.which, " (switched)");
         if (pad && e->gbutton.which != TEST_DEVICE && e->gbutton.which != SDL_GetGamepadID(pad)) break;  // (another pad)
         if (!host_test || e->gbutton.which == TEST_DEVICE) {  // (the press as the event has it, before reading the pad)
             uint64_t b = pad_bits(e->gbutton.button);
@@ -474,7 +755,12 @@ void input_handle_event(const SDL_Event *e) {
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-        if (!host_test && abs(e->gaxis.value) > 24000 && pad_at_rest()) use_pad(e->gaxis.which, " (switched)");
+        if (g_players > 1) {
+            int k = slot_of(e->gaxis.which);
+            if (k) recompute_slot(k);
+            if (k || e->gaxis.which != pad_id) break;
+        }
+        if (!host_test && abs(e->gaxis.value) > 24000 && pad_at_rest() && g_players == 1) use_pad(e->gaxis.which, " (switched)");
         if (pad && e->gaxis.which != SDL_GetGamepadID(pad)) break;  // (another pad's stick: not the game's)
         if ((e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) &&
             !host_test) {  // (the triggers as buttons: past half way)
@@ -529,6 +815,14 @@ static void test_push(uint64_t frame, unsigned long start, unsigned long len, co
         if (frame == start && sscanf(arg, "%ux%u", &w, &h) == 2 && w && h && w < 65536 && h < 65536) {
             LOG("[input] test: window to %ux%u\n", w, h);
             __atomic_store_n(&g_window_resize_request, w << 16 | h, __ATOMIC_RELAXED);
+        }
+        return;
+    }
+    if (!strcmp(dev, "window")) {  // "frame:window:minimize" / "frame:window:restore" (a player's alt-tab / minimise)
+        extern uint32_t g_window_state_request;  // (runtime/ui/menu.mm menu_apply_window_requests applies it)
+        if (frame == start) {
+            LOG("[input] test: window %s\n", arg);
+            __atomic_store_n(&g_window_state_request, !strcmp(arg, "minimize") ? 1u : 2u, __ATOMIC_RELAXED);
         }
         return;
     }
@@ -605,16 +899,21 @@ static void host_test_frame(uint64_t frame) {
     if (need > cap) { free(buf); buf = malloc(need); cap = need; }
     if (hspec) {
         uint8_t keys[SDL_SCANCODE_COUNT] = {0};
-        uint32_t padm = 0;
+        uint32_t padm = 0, slotm[INPUT_MAX_PLAYERS] = {0};
         int32_t sx = 0, sy = 0;
         snprintf(buf, cap, "%s", hspec);
         char *save = NULL;
         for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
             unsigned long start = 0, len = 10;
             char dev[8] = "", name[400] = "";
-            if (sscanf(tok, "%lu:%7[a-z]:%399[^:]:%lu", &start, dev, name, &len) < 3) continue;
+            if (sscanf(tok, "%lu:%7[a-z0-9]:%399[^:]:%lu", &start, dev, name, &len) < 3) continue;
+            if (dev[0] == 'p' && dev[1] >= '2' && dev[1] <= '4' && !dev[2]) {  // "p2:<button>": player 2's controller
+                int h = bind_pad_from_name(name);
+                if (frame >= start && frame < start + len && h >= 0) slotm[dev[1] - '1'] |= 1u << h;
+                continue;
+            }
             if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "shot") ||
-                !strcmp(dev, "resize") || !strcmp(dev, "mouse")) {
+                !strcmp(dev, "resize") || !strcmp(dev, "window") || !strcmp(dev, "mouse")) {
                 test_push(frame, start, len, dev, name);
                 continue;
             }
@@ -629,6 +928,8 @@ static void host_test_frame(uint64_t frame) {
         test_lx = sx, test_ly = sy;
         if (kch) recompute_keyboard();
         if (pch) recompute_pad();
+        for (int k = 1; k < INPUT_MAX_PLAYERS; k++)
+            if (test_slot_host[k] != slotm[k]) test_slot_host[k] = slotm[k], recompute_slot(k);
     }
     if (bspec) {
         snprintf(buf, cap, "%s", bspec);
@@ -735,6 +1036,39 @@ uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_butto
 
 static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
 
+// The stick's directions also appear as buttons (bits 16-23)
+static uint64_t stick_bits(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
+    uint64_t b = 0;
+    if (lx < -16000) b |= 1ull << 16;
+    if (ly > 16000) b |= 1ull << 17;
+    if (lx > 16000) b |= 1ull << 18;
+    if (ly < -16000) b |= 1ull << 19;
+    if (rx < -16000) b |= 1ull << 20;
+    if (ry > 16000) b |= 1ull << 21;
+    if (rx > 16000) b |= 1ull << 22;
+    if (ry < -16000) b |= 1ull << 23;
+    return b;
+}
+
+// Player k + 1 (k >= 1): their controller only (the keyboard is player 1's)
+static void fill_slot_state(uint8_t *s, int k) {
+    bool menu = menu_input_captured();
+    uint64_t b = menu ? 0 : slot_buttons[k];
+    int32_t lx = menu ? 0 : slot_lx[k], ly = menu ? 0 : slot_ly[k], rx = menu ? 0 : slot_rx[k], ry = menu ? 0 : slot_ry[k];
+    if (!menu && g_settings.dpad_move && (int64_t)lx * lx + (int64_t)ly * ly < 8000ll * 8000) {  // (as player 1's)
+        int dx = (int)((b >> BTN_RIGHT) & 1) - (int)((b >> BTN_LEFT) & 1), dy = (int)((b >> BTN_UP) & 1) - (int)((b >> BTN_DOWN) & 1);
+        int32_t m = dx && dy ? 23170 : 32767;
+        if (dx || dy) lx = dx * m, ly = dy * m;
+    }
+    b |= stick_bits(lx, ly, rx, ry);
+    *(uint64_t *)(s + 8) = b;
+    *(int32_t *)(s + 16) = lx;
+    *(int32_t *)(s + 20) = ly;
+    *(int32_t *)(s + 24) = rx;
+    *(int32_t *)(s + 28) = ry;
+    *(uint32_t *)(s + 32) = 1;  // IsConnected
+}
+
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
 static void fill_state(Cpu *c) {
@@ -744,7 +1078,10 @@ static void fill_state(Cpu *c) {
     *(int64_t *)s = ++sampling;
     static int nlog;
     if (nlog < 6 && (sampling % 600) == 1) { nlog++; LOG("[input] GetNpadState id %#x lr %llx\n", id, c->x[30]); }
-    if (id != 0) return;  // docked: only player 1 (FullKey); Handheld stays disconnected
+    if (id != 0) {  // docked: players 2-4 when set up (FullKey, their own controllers); Handheld stays disconnected
+        if (id < INPUT_MAX_PLAYERS && (int)id < g_players) fill_slot_state(s, (int)id);
+        return;
+    }
     extern uint64_t g_watch_lo, g_watch_hi;
     if (id == 0 && !g_pad_obj) g_pad_obj = c->x[1] - 8;
     if (id == 0 && !g_watch_lo && getenv("LARECOMP_WATCH_PAD")) {
@@ -767,6 +1104,18 @@ static void fill_state(Cpu *c) {
         } else if (f > tap_frame) tap = 0;
     }
     uint64_t b = menu ? script_buttons : held | tap | script_buttons;
+    {   // Skip the title screen (setting): L + R held from the start as a player holding them would - the title screen
+        // takes them and goes to the main menu, whose buttons act on presses only (held from before, nothing happens).
+        // The safety screen before the title is timed: it stays. The player's own first press, or 30 s, ends it.
+        static int skip = -1;  // (-1: not decided yet, 1: holding, 0: done)
+        extern uint64_t renderer_present_count(void);
+        if (skip < 0) skip = g_settings.skip_title ? 1 : 0;
+        if (skip == 1 && (held || renderer_present_count() > 1800)) {
+            skip = 0;
+            LOG("[input] skip the title: L + R released (%s)\n", held ? "the player pressed something" : "30 s");
+        }
+        if (skip == 1 && !menu) b |= 1ull << BTN_L | 1ull << BTN_R;
+    }
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;
@@ -878,7 +1227,7 @@ HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
     static int nlog;
     if (nlog++ < 4) LOG("[input] GetNpadStyleSet id %#x\n", id);
-    c->x[0] = id == 0 ? 1 : 0;  // docked: no handheld controller
+    c->x[0] = id == 0 || (id < INPUT_MAX_PLAYERS && (int)id < g_players) ? 1 : 0;  // docked: no handheld controller
 }
 
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a

@@ -17,10 +17,12 @@ static inline uint16_t rumble_amplitude(float a) {
 // Accept the older synthetic 0x03000000 | player<<8 | side for compatibility.
 static inline int rumble_side(uint32_t h) {
     if ((h & ~1u) == 0x03000000u) return h & 1;
-    if ((h & 0xff00ff00u) == 0 && (h & 255) >= 3 && (h & 255) <= 5 && ((h >> 16) & 255) <= 1)
+    if ((h & 0xff000000u) == 0 && ((h >> 8) & 255) < 4 && (h & 255) >= 3 && (h & 255) <= 5 && ((h >> 16) & 255) <= 1)
         return (h >> 16) & 1;
-    return -1;  // this runtime exposes player 1 only
+    return -1;  // players 1 to 4 only (runtime/hle/input.c: players 2-4 have a controller each)
 }
+// The player (0-3) a handle's vibration is for (valid when rumble_side >= 0).
+static inline int rumble_player(uint32_t h) { return (h & ~1u) == 0x03000000u ? 0 : (int)((h >> 8) & 255); }
 
 // No frequency control exists in SDL_RumbleGamepad: low/high amplitudes map
 // linearly to its large/small motors. Mix L/R devices by maximum, not sum,

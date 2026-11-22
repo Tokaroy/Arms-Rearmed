@@ -298,6 +298,8 @@ bool menu_handle_event(const SDL_Event *e) {
 }
 
 extern "C" uint32_t g_window_resize_request;  // (test scripts: runtime/hle/input.c "resize")
+extern "C" uint32_t g_window_state_request;   // (test scripts: "window": 1 minimise, 2 restore)
+uint32_t g_window_state_request;
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
     g_pixel_density = SDL_GetWindowPixelDensity(w);
@@ -315,6 +317,10 @@ void menu_apply_window_requests(void *win) {
     }
     if (uint32_t r = __atomic_exchange_n(&g_window_resize_request, 0u, __ATOMIC_RELAXED))
         SDL_SetWindowSize(w, (int)(r >> 16), (int)(r & 0xffff));
+    if (uint32_t s = __atomic_exchange_n(&g_window_state_request, 0u, __ATOMIC_RELAXED)) {
+        if (s == 1) SDL_MinimizeWindow(w);
+        else SDL_RestoreWindow(w);
+    }
 }
 
 // ------------------------------------------------------------------ render thread
@@ -508,10 +514,10 @@ static void tab_display(void) {
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
 
     opt_section("Game");
-    opt_toggle("Remove blur", &g_settings.blur_removal, false,
-               "Turns off the tilt-shift blur at the top and bottom of the screen.");
-    opt_toggle("Hide Hero Mode icon", &g_settings.hide_hero_icon, false,
-               "Hides the Hero Mode emblem in the corner of the screen while playing a Hero Mode file.");
+    // (Link's Awakening's "Remove blur" and "Hide Hero Mode icon" were here: nothing in ARMS)
+    opt_toggle("Skip the title screen", &g_settings.skip_title, false,
+               "Goes straight to the main menu after the safety screen at start, without pressing L + R. Pressing "
+               "anything before then shows the title as usual.");
     opt_end();
 }
 
