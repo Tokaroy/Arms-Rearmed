@@ -77,13 +77,18 @@ void rt_crash_explain(char *out, size_t n, const char *log_path) {
         snprintf(what, sizeof what, "The game's text for this language comes from another language (a translation "
                  "patch), and the game stopped at a question it can't show that way. Set up unmodified game files on "
                  "the start screen (Game Files). To play in another language, pick it in Settings (Language).");
+    } else if (has("exefs/main is missing") || has("game code hasn't been built")) {
+        snprintf(head, sizeof head, "ARMS Rearmed isn't set up yet");
+        snprintf(what, sizeof what, "Run armslauncher.exe (not armsrecomp.exe): on GAME FILES, choose your ARMS game "
+                 "(XCI or NSP), its update (5.5.1 or 5.4.0) and your prod.keys, then press INSTALL. With RecompLauncher, "
+                 "use Set up on the game's page.");
     } else if (has("built for another version")) {
         snprintf(head, sizeof head, "The game code was built for other game files or another version of ARMS Rearmed");
         snprintf(what, sizeof what, "Start ARMS Rearmed again from its launcher (or RecompLauncher): it rebuilds the "
                  "game code for these game files by itself.");
     } else if (has("unsupported version of the game")) {
         snprintf(head, sizeof head, "Wrong version of the game");
-        snprintf(what, sizeof what, "ARMS Rearmed needs ARMS version 5.4.0: the base game with its 5.4.0 update. Set "
+        snprintf(what, sizeof what, "ARMS Rearmed needs ARMS version 5.4.0 or 5.5.1: the base game with one of those updates. Set "
                  "up those game files again (GAME FILES in the launcher, or Set up in RecompLauncher).");
     } else if (has("no font for the game's text")) {
         snprintf(head, sizeof head, "No font for the game's text");

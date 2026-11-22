@@ -1,4 +1,4 @@
-// The supported game versions (ARMS 5.4.0, the last update), selected by the main program's build ID
+// The supported game versions (ARMS 5.4.0 and 5.5.1, the last update), selected by the main program's build ID
 // (game_addresses.h). The RomFS file checks have no file list yet: they accept every file.
 #include "game_addresses.h"
 
@@ -9,9 +9,11 @@
 #include "rt.h"
 
 static const GameAddrs ga_v5_4_0 = {0};
+static const GameAddrs ga_v5_5_1 = {0};  // (the same SDK build as 5.4.0: sdk, rtld and subsdk0 are identical)
 
 static const GameVersion versions[] = {
     {"v5_4_0", "5.4.0", "501924B7C22129E5803F487E98B635BC00000000", &ga_v5_4_0},
+    {"v5_5_1", "5.5.1", "BBA3811191DE71D9B55E53F918AE5DC100000000", &ga_v5_5_1},
 };
 
 const GameAddrs *g_ga;
@@ -72,8 +74,8 @@ bool game_version_select(const char *game_dir, char *why, size_t why_size) {
     const GameVersion *v = game_version_by_build_id(id);
     if (!v) {
         snprintf(why, why_size, "these game files are an unsupported version of the game (main build ID "
-                 "%02X%02X%02X%02X%02X%02X%02X%02X): ARMS Rearmed needs ARMS 5.4.0 (the base "
-                 "game with its last update: tools/nsp_extract.py --update)",
+                 "%02X%02X%02X%02X%02X%02X%02X%02X): ARMS Rearmed needs ARMS 5.4.0 or 5.5.1 (the "
+                 "base game with its 5.4.0 or 5.5.1 update: tools/nsp_extract.py --update)",
                  id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]);
         return false;
     }

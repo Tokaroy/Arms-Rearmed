@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "game_addresses.h"
 #include "gamelib.h"
@@ -224,6 +225,27 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+#ifdef _WIN32
+    // The release's armsrecomp.exe opened before the game was set up (the game's code not extracted or not built):
+    // the launcher next to it instead, which sets the game up, rather than a "missing exefs/main" error
+    if (argc == 1) {
+        char path[1100], exe[1024];
+        struct stat st;
+        snprintf(path, sizeof path, "%s/exefs/main", root);
+        bool set_up = stat(path, &st) == 0;
+        char *slash = plat_exe_path(exe, sizeof exe) ? strrchr(exe, '\\') : NULL;
+        if (slash) {
+            snprintf(path, sizeof path, "%.*s\\armsgame.dll", (int)(slash - exe), exe);
+            set_up = set_up && stat(path, &st) == 0;
+            snprintf(path, sizeof path, "%.*s\\armslauncher.exe", (int)(slash - exe), exe);
+            if (!set_up && stat(path, &st) == 0) {
+                LOG("[boot] the game isn't set up yet: starting the launcher (%s)\n", path);
+                char *const av[] = {path, NULL};
+                plat_exec(av);  // (returns only when it couldn't start it: then the error below says what to do)
+            }
+        }
+    }
+#endif
     for (;;) {  // (no start screen yet: straight into the game, and a reboot boots it again)
         boot(root);
         ui_run();  // window and input on the main thread; returns when a reboot is requested
