@@ -87,6 +87,12 @@ upscaling, SMAA and the aspect ratio. ARMS runs at its own 60 fps: its fights st
 tab): Full keeps the fights' 3D at the game's highest resolution instead of letting the game lower it, which makes
 4-player split screen much sharper (the default, except on integrated graphics).
 
+**FSR 3 anti-aliasing (experimental).** Anti-aliasing has a third choice, AMD FSR 3: temporal anti-aliasing that builds
+each picture over several frames, for the smoothest edges and steadier fine detail. The recomp gives it the motion of
+everything on screen (the camera, the fighters, their arms, the crowd) and marks animated surfaces and effects so they
+don't smear. It works for every player in split screen (each view keeps its own history) and with every internal
+resolution, Dynamic included. AMD's FSR 3 library ships with the game (its license: `AMD-FidelityFX-LICENSE.txt`).
+
 **2 to 4 players.** Choose 2P, 3P or 4P in the game (Versus, Grand Prix, the tutorial) and each player gets a
 controller of their own; player 1 also plays with the keyboard. One controller short, the keyboard is player 1 and
 the controllers are players 2 on. Controllers that show a player number light it. The in-game menu's Controls tab

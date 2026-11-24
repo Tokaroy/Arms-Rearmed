@@ -284,6 +284,77 @@ address table of its own.
   (`cq_mode`): the setting can change in game.
 - Asked for, not done: DLSS / FSR 3. Both are temporal upscalers that need the game's motion vectors and a jittered
   camera; ARMS has neither to hand, so it would mean finding and changing the game's camera and adding a velocity pass.
+  (Done next: below.)
+
+## AMD FSR 3 anti-aliasing (2026-11-24, experimental)
+
+Anti-aliasing "FSR 3" (`antialias = fsr3`; Video tab, launcher, RecompLauncher): AMD's FSR 3.1 upscaler in native-AA
+mode on the 3D scene only. DLSS would need the same inputs plus NVIDIA's closed SDK and an RTX card: not done.
+- **The library** (`runtime/nvn/vulkan/fsr3.cpp`): AMD's signed Vulkan DLLs (FSR SDK 2.4.0, upscaler 3.1.6), loaded at
+  run time through the FidelityFX API; `tools/fetch_ffx.sh` fetches them and the API headers by SHA-256 into
+  build/deps-win/ffx (not in the repository); `make dlls` / `make dist` copy them next to the game, the release with
+  AMD's license. One context for every size up to the largest seen (`FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION`): a context
+  per size stalled for the GPU. Its dispatch records on the recorder thread (`rec_CmdCall`, `record.c`).
+- **Where** (`exec.c`, the "AMD FSR 3" section): a fight frame draws its 3D into an HDR B10G11R11 target with depth,
+  then bloom and the tone map read it, then the HUD. The scene's draws are those into a scalable depth target with no
+  colour or the HDR one (`fsr_scene_pass`); its camera is vertex constant buffer 3 (2336 bytes: view 3x4 at float 0,
+  view-projection 4x4 at 12, projection 4x4 at 28, inverse view at 44). FSR runs before the first draw outside the
+  scene that samples the scene's colour, and its output replaces that colour: the HUD stays out of it.
+- **Jitter** (`cbuf_jittered`): the camera buffer's copy the GPU reads gets Halton(2,3) sub-pixel offsets on its
+  view-projection and projection rows (8 phases), in the pixels of its view's scene (the half-size passes of a view -
+  ambient occlusion's depth - get the same offset).
+- **Dynamic resolution**: the scene images keep their allocation and each frame is drawn into their top-left part
+  (`content_extent`: the render scale over the allocation scale). FSR works on that part (`Fsr3Args.rw / rh`: render
+  size = output size = the part; the images described whole; motion in the images' uv, `motionVectorScale` their
+  size): the camera-motion pass's inverse takes the images' NDC to the part's first and last frame's view-projection
+  gives the images' NDC, so `fsr_mv.frag` is unchanged; the replay draws into the part (its viewport) and scales its
+  motion by part / image (push constant `s`); jitter is in the part's pixels; the copy back is the part. A step of the
+  dynamic scale starts that view's history over (another output size). In the fixed modes the part is the whole image
+  (nothing differs). Tested pinned at 0.7 (`LARECOMP_DYN_TEST`: 1P 1120x630 of 1600x900, 2P 560x630 a view) and
+  stepping 0.5 -> 1.0 mid-fight (`LARECOMP_DYN_START=0.5`).
+- **Views** (split screen, `FsrView`, `fsr_view_of`): each player's view is drawn through its own targets (800x900 in
+  2P, 800x450 in 3P / 4P; the views of a frame may share one image, drawn one after another), and in 3P / 4P only two
+  views a frame, the others the next. A view has its own FSR context (`fsr3.cpp`: one per slot, up to 4), jitter
+  sequence (advancing when it's drawn), camera history and its draws' captures; its "last frame" is the last frame it
+  was drawn in (the capture's thirds keep 2 frames). Views are followed by their camera: the game double-buffers the
+  camera buffers (1P: two addresses frame about frame) and the order in a frame says nothing in 3P / 4P, so a camera
+  first seen in a frame takes the slot whose last camera is nearest (position + 20 x direction, under 40), else a new
+  one. Captured draws carry their view; identity and matching are per view. A new view takes the slot of a view gone
+  (not drawn for 2 frames: a camera cut) before a free one: 1P uses 2 slots, not all 4 after a few cuts. Each context
+  is made at the resolution setting's largest scene (1920x1080 x the allocation scale) the first time: growing one
+  mid-fight waited for the GPU (a 35 ms frame). (Their memory: up to 4 contexts at that size in split screen.)
+- **Motion**: the camera's from the depth and both frames' view-projections (`fsr_mv.frag`); then what moves by itself.
+  The scene's draws use a vertex shader variant (`ShaderKey.capture`, `translate.c`) that also stores each vertex's
+  final clip position into a capture buffer (bindings 27 / 28: the buffer, a per-draw header), a third per frame. Each
+  captured draw gets an identity (its shaders, index buffer, counts, first vertex stream, and its order among identical
+  draws) and a copy of its indices; the next frame's same draw finds where its vertices were, and a velocity pass
+  (`fsr_vel.vert` / `.frag`) replays the matched draws from the two captures, depth-tested against the scene, writing
+  their motion over the camera's. Skinning, the stretching arms and the crowd's animation all come out of the captured
+  positions. In a fight ~350 draws a frame, nearly all matched.
+- **Reactive mask** (FSR trusts the current frame there): draws that don't write depth (effects, glows, the scrolling
+  LED boards - their text is a texture animation, no motion). Without it the boards' text smeared away. (A first
+  version also marked draws whose fragment constants or textures changed since last frame: it caught a third of all
+  draws, every draw at times - FSR barely smoothed them - and the boards were already covered: removed.)
+- **Shader preparation**: `SR_CAPTURE` variant records; with FSR 3 on, the scene's recorded draws are also prepared as
+  their capture variant (first launch with it: ~36 s instead of ~4, cached after: ~8.6 s).
+- Measured (i7-11700F, NVIDIA, 1P Versus, no screenshots): Off / SMAA / FSR 3 all 60 fps at 1x and 2x, worst frame
+  18-24 ms. Checked: static edges smoother than SMAA, the idling fighter's doubled edges of camera-only motion gone,
+  punches and ribbons clean mid-fight, the LED boards readable. Split screen (`LARECOMP_TEST_PADS`): 2P, 3P and 4P
+  fights with every view on FSR, ~99% of each view's draws matched, one history reset per run (the start), 60 fps at
+  1x and 2x - the same as without it.
+- **When FSR 3 can't run** (AMD's DLLs missing, no context, a scene colour format it doesn't take): SMAA in its place
+  (`fsr_fallback_smaa`, said once in the log), not no anti-aliasing at all.
+- **Turned on in game**: the capture variants weren't prepared (the start's preparation makes them only with FSR 3
+  already on): they compiled at first use in play. Now the preparation runs again in the background the first time
+  it's turned on (`shader_prep_capture_background`; ~4 s here, one 58 ms frame at the switch, smooth after).
+  `LARECOMP_TEST_FSR_AT=<frame>`: anti-aliasing turned to FSR 3 then (test).
+- **2-player split screen wasn't scaled** (found on the way): `tex_scalable` took 16:9 targets only, and 2P's views are
+  800x900 (8:9, half of 16:9): at 2x / 3x 2P fights were drawn at 1x and stretched. 8:9 targets scale too now (Vulkan
+  and Metal).
+- Switches: `LARECOMP_FSR_NO_OBJECTS=1` (camera motion only), `LARECOMP_FSR_NO_REACTIVE=1`, `LARECOMP_FSR_JSCALE=<k>`
+  (jitter x k), `LARECOMP_FSR_DEBUG_VIEW=1` (FSR's own debug view), `LARECOMP_FSR_LOG=1` (the views of the first 4
+  frames of each second). `LARECOMP_WINDOW_SHOT` now takes the first frame at or after its number (a frame the render
+  queue skipped had no shot).
 
 What this project changed relative to [LAS Recomp](https://github.com/peiikai/LASRecomp) (its recompiler and Switch
 runtime), why, and where. It also lists the debugging switches, the test routes, the known gaps and the next steps.

@@ -245,7 +245,7 @@
       "id": "antialias",
       "label": "Anti-aliasing",
       "group": "Quality",
-      "help": "Smooths jagged edges.",
+      "help": "Smooths jagged edges. FSR 3 (experimental): AMD's temporal anti-aliasing - the smoothest edges, in split screen and with every internal resolution.",
       "choices": [
         {
           "label": "Off",
@@ -257,6 +257,12 @@
           "label": "SMAA",
           "set": {
             "antialias": "smaa"
+          }
+        },
+        {
+          "label": "FSR 3 (experimental)",
+          "set": {
+            "antialias": "fsr3"
           }
         }
       ],

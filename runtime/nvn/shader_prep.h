@@ -23,12 +23,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-enum { SR_FLIP_Y = 1, SR_DEPTH_MINUS_ONE = 2, SR_FLIP_X = 4 };
+enum { SR_FLIP_Y = 1, SR_DEPTH_MINUS_ONE = 2, SR_FLIP_X = 4, SR_CAPTURE = 8 /* FSR 3: ShaderKey.capture */ };
 
 typedef struct {
     char kind;               // 'G' graphics pipeline, 'C' compute program
     uint64_t vs, fs;         // code hashes (shader_code_hash); compute: vs
-    uint8_t flags;           // SR_*: lower-left window origin, NVN depth mode [-1, 1], mirrored composite
+    uint8_t flags;           // SR_*: lower-left window origin, NVN depth mode [-1, 1], mirrored composite, FSR capture
     uint8_t nattrib, nstream, ncolor;
     uint32_t attrib[16];     // NVN vertex attribute state: format | stream << 8 | offset << 13
     uint32_t stream[16][2];  // vertex stream stride, divisor
@@ -120,6 +120,8 @@ void renderer_prepare_end(void);  // all builds done (e.g. keep the pipeline cac
 bool shader_prep_run(const char *romfs, void (*progress)(int done, int total), const volatile int *cancel);
 // (LARECOMP_SHADER_PREP=1, tests) the same at game start, before the game's first frame: runtime/nvn/objects.c
 void shader_prep_boot(const char *romfs);
+// FSR 3 turned on in game: its capture variants prepared in the background, once, unless the start's run made them
+void shader_prep_capture_background(void);
 
 // ---- the shader caches' tag (Metal binary archive, Vulkan pipeline cache): this build, the translator, the prepared
 // objects' format and the GPU / driver; a cache with another tag is discarded (rebuilt as the game runs)

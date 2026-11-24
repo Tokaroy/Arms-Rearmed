@@ -879,6 +879,23 @@ void rec_CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderS
     ENQ_END();
 }
 
+// A function of the caller's run with the command buffer at its place in the order (FSR 3's dispatch records into it:
+// fsr3.cpp). The argument's bytes travel in the packet, as every packet's do.
+CMD_ARGS(CmdCall, void (*fn)(VkCommandBuffer, const void *); uint32_t size;)  // then the argument's bytes
+static void CmdCall_run(const void *p) {
+    const CmdCallArgs *a = p;
+    a->fn(a->cb, after(a, sizeof *a));
+}
+void rec_CmdCall(VkCommandBuffer cb, void (*fn)(VkCommandBuffer, const void *), const void *arg, uint32_t size) {
+    if (on <= 0) { fn(cb, arg); return; }
+    ENQ_T0();
+    CmdCallArgs *a = push(CmdCall_run, sizeof *a, size);
+    *a = (CmdCallArgs){cb, fn, size};
+    memcpy(after(a, sizeof *a), arg, size);
+    commit();
+    ENQ_END();
+}
+
 // (device.c's overlay: secondary command buffers the presenting thread recorded and ended before queuing this; their pool
 // is not touched again until the GPU finished the submission that executes them)
 CMD_ARGS(CmdExecuteCommands, uint32_t n;)  // then VkCommandBuffer[n]

@@ -2559,6 +2559,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                    "gfast_.w[%uu + i] = gmap[%d].y; return gmap[i].z + (o >> 2); } } "
                    "return 0xFFFFFFFFu; }\n", GMAP_MAX, GFAST_FLAG_WORD, GMAP_MAX);
     }
+    if (stage == STAGE_VERTEX && key && key->capture && key->glsl) {  // (FSR 3: ShaderKey.capture)
+        sp(&s, "layout(std430, set = %d, binding = %d) writeonly buffer Cap { vec4 cap[]; };\n", set, CAPTURE_BUFFER_INDEX);
+        sp(&s, "layout(std140, set = %d, binding = %d) uniform CapH { uvec4 caph[2]; };\n", set, CAPTURE_HEADER_INDEX);
+    }
     if (c->uses_rscale && stage != STAGE_VERTEX) {
         sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[%d]; };\n", set,
            key && key->flip_x ? 66 : 65);  // ([65]: mirror mode's render target width)
@@ -2653,6 +2657,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (key && key->flip_y) sp(&s, "  gl_Position.y = -gl_Position.y;\n");
         if (key && key->flip_x) sp(&s, "  gl_Position.x = -gl_Position.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5f;\n");
+        if (key && key->capture && key->glsl)  // (the position as rasterized, at vertex - first vertex + instance x count)
+            sp(&s, "  { uint ci_ = uint(gl_VertexIndex - int(caph[0].x)) + uint(gl_InstanceIndex - int(caph[0].z)) * caph[0].y;\n"
+                   "    if (ci_ < caph[0].w) cap[caph[1].x + ci_] = gl_Position; }\n");
     } else if (stage == STAGE_FRAGMENT) {
         int r = 0;
         for (int rt = 0; rt < 8; rt++) {

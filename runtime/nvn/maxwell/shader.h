@@ -44,6 +44,10 @@ typedef struct {
     bool flip_y;            // lower-left window origin
     bool flip_x;            // mirror the image left to right (mirror mode's scene composite). (In the padding
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
+    bool capture;           // (GLSL vertex) also store each vertex's final clip position for FSR 3's motion vectors:
+                            // CAPTURE_BUFFER_INDEX (storage, vec4 per vertex) at the draw's place given by
+                            // CAPTURE_HEADER_INDEX (uniform uvec4[2]: first vertex, vertices per instance, first
+                            // instance, count; the draw's first vec4 in the buffer). (In the padding after flip_x.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     uint32_t tex_stencil_mask;  // (GLSL) bound texture slots k (handle at 0x20 + 8 * k) sampled as stencil: a usampler
@@ -95,6 +99,9 @@ typedef struct {
 // (GLSL compute, Vulkan) the fast copy of a dispatch's storage buffers: its address table and its data
 #define GMAP_BUFFER_INDEX 20
 #define GFAST_BUFFER_INDEX 21
+// (GLSL vertex, ShaderKey.capture) FSR 3's vertex position capture: its storage and its per-draw header
+#define CAPTURE_BUFFER_INDEX 27
+#define CAPTURE_HEADER_INDEX 28
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i].x = heap offset, .y = size, .z = word
                      // offset in GFast, .w = the bound bytes (from the entry's start: their first byte in the low 8 bits,
                      // their end in words above); [GMAP_MAX].x = count, .y = the dispatch's stamp)

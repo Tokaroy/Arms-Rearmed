@@ -513,6 +513,7 @@ static void create_device(void) {
     b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;  // (SUST / SULD: images
     b->shaderStorageImageReadWithoutFormat = h->shaderStorageImageReadWithoutFormat;    //  without a format qualifier)
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
+    g_vk.vertex_stores = h->vertexPipelineStoresAndAtomics;
     g_vk.ssbo_chunks = h->fragmentStoresAndAtomics && h->vertexPipelineStoresAndAtomics && h->robustBufferAccess;
     b->shaderClipDistance = h->shaderClipDistance;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
@@ -1065,7 +1066,9 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         pp_mark(PP_OVERLAY);
         static long win_shot = -1;
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
-        bool shot = win_shot && (long)frame + 1 == win_shot;
+        static bool shot_done;  // (the first presented frame at or after it: a frame the render queue skipped had none)
+        bool shot = win_shot && !shot_done && (long)frame + 1 >= win_shot;
+        if (shot) shot_done = true;
         vk_frame_end(shot ? "build/window.png" : NULL);
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) exit_after_shot();
     } else {

@@ -11,6 +11,7 @@
 
 #include "nvn.h"
 #include "shader_prep.h"
+#include "../settings.h"  // (FSR 3's capture variants: g_settings.antialias)
 
 uint64_t shader_code_hash(const uint8_t *code, size_t n) {  // FNV-1a, 64-bit
     uint64_t h = 0xcbf29ce484222325ull;
@@ -585,9 +586,27 @@ bool shader_prep_run(const char *romfs, void (*progress)(int done, int total), c
     return ok;
 }
 
+// FSR 3's capture variants (ShaderKey.capture): prepared by a run made with FSR 3 on. Turned on in game after the
+// start's run, they'd compile at first use in play; shader_prep_capture_background runs the preparation again then
+// (in the background: what is prepared already is skipped, the tables are locked, a draw that comes first compiles its own)
+static _Atomic bool g_prep_capture, g_prep_capture_started;
+static void *capture_prep_thread(void *arg) {
+    (void)arg;
+    extern const char *g_romfs_dir;
+    LOG("[shader] FSR 3 turned on: preparing its shader variants in the background\n");
+    shader_prep_run(g_romfs_dir, NULL, NULL);
+    return NULL;
+}
+void shader_prep_capture_background(void) {
+    if (atomic_load(&g_prep_capture) || atomic_exchange(&g_prep_capture_started, true)) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, capture_prep_thread, NULL) == 0) pthread_detach(t);
+}
+
 static bool prep_run_locked(const char *romfs, void (*progress)(int done, int total), const volatile int *cancel) {
     double t0 = ms_now();
     char *list = NULL;
+    if (g_settings.antialias == AA_FSR3) atomic_store(&g_prep_capture, true);  // (this run prepares them: below)
     if (getenv("LARECOMP_SHADER_LIST")) {
         FILE *f = fopen(getenv("LARECOMP_SHADER_LIST"), "rb");
         if (f) {
@@ -658,6 +677,14 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
         if (!dv || (r.kind == 'G' && !df)) missing++;
         else if (renderer_prepare(&r, &bv, &bf)) *(own ? &prepared_seen : &prepared) += 1;
         else failed++;
+        // FSR 3 on: the 3D scene's draws (its HDR colour target or none, its depth) also as the capture variant they
+        // use then (ShaderKey.capture), so turning it on doesn't compile them in game
+        if (dv && df && r.kind == 'G' && !(r.flags & SR_CAPTURE) && g_settings.antialias == AA_FSR3 && r.depth == 0x34 &&
+            (r.ncolor == 0 || r.color[0] == 0x3f || r.color[0] == 0)) {
+            ShaderRec rc = r;
+            rc.flags |= SR_CAPTURE;
+            renderer_prepare(&rc, &bv, &bf);
+        }
         free(dv);
         free(df);
         if (progress && (++done & 7) == 0) progress(done - renderer_prepare_pending(), total + 1);

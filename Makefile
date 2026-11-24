@@ -12,7 +12,7 @@ PY       := .venv/Scripts/python.exe
 
 # The release's version (its zip's name, the log's [info] line). RELEASE=1: the build `make dist` ships (no console
 # window - the log goes to armsrecomp.log next to the exe - no debug info, the original icon, DEPS' LGPL FFmpeg).
-VERSION  := 0.1.4
+VERSION  := 0.1.5
 RELEASE  ?=
 DEPS     ?=
 
@@ -104,6 +104,14 @@ $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
 
+# AMD FSR 3 (runtime/nvn/vulkan/fsr3.cpp): the FidelityFX API's headers and AMD's signed Vulkan DLLs, fetched by
+# tools/fetch_ffx.sh into build/deps-win/ffx (not in the repository); the DLLs are loaded at run time
+FFX_DIR := build/deps-win/ffx
+$(B)/rt/nvn/vulkan/fsr3.o: CXXFLAGS += -I$(FFX_DIR)/api/include -I$(FFX_DIR)/upscalers/include
+$(B)/rt/nvn/vulkan/fsr3.o: $(FFX_DIR)/.ok
+$(FFX_DIR)/.ok: tools/fetch_ffx.sh
+	sh tools/fetch_ffx.sh $(FFX_DIR)
+
 $(B)/inc/shader_variants.inc: runtime/nvn/shader_variants.txt
 	@mkdir -p $(dir $@)
 	(LC_ALL=C tr -d '\r' < $< | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/'; echo '""') > $@
@@ -150,6 +158,7 @@ all: $(LAUNCHER)
 DLL_STAMP := $(B)/.dlls
 $(DLL_STAMP): $(wildcard $(EXE) $(LAUNCHER))
 	@for f in $$(ldd $^ | grep -io '/ucrt64/bin/[^ ]*\.dll' | sort -u); do cp -u "$$f" $(B)/; done
+	@if [ -f $(FFX_DIR)/.ok ]; then cp -u $(FFX_DIR)/bin/*.dll $(B)/; fi  # (FSR 3: loaded at run time)
 	@echo "runtime DLLs copied into $(B)/"
 	@touch $@
 dlls: $(EXE) $(LAUNCHER)
@@ -187,6 +196,7 @@ dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
 	@[ -f build/helper/armsgen/armsgen.exe ] || { echo "make gen-helper first (the extractor and generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
+	@[ -f $(FFX_DIR)/.ok ] || sh tools/fetch_ffx.sh $(FFX_DIR)  # (AMD FSR 3: headers and the signed DLLs)
 	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 GEN=build/no-generated-code \
 	    $(WIN_B)/armsrecomp.exe $(WIN_B)/armslauncher.exe
 	! nm $(WIN_B)/armsrecomp.exe | grep -E ' f_70[0-9a-f]{8}' >/dev/null  # (no game code inside)
@@ -207,6 +217,8 @@ dist:
 	cp third_party/fonts/BIZUDPGothic/OFL.txt "$(DIST)/BIZUDPGothic-OFL.txt"
 	cp README.md LICENSE.LASRecomp recomplauncher.json "$(DIST)/"
 	cp docs/THIRD_PARTY.md "$(DIST)/THIRD_PARTY.txt"
+	cp $(FFX_DIR)/bin/amd_fidelityfx_loader_vk.dll $(FFX_DIR)/bin/amd_fidelityfx_upscaler_vk.dll "$(DIST)/"  # (FSR 3)
+	cp $(FFX_DIR)/LICENSE-AMD-FidelityFX.md "$(DIST)/AMD-FidelityFX-LICENSE.txt"
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/armsrecomp.exe $(WIN_B)/armslauncher.exe | \
 	    awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc|libssl|gnutls'  # (no GPL codec libraries in the release)

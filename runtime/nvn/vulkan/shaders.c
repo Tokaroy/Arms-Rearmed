@@ -304,6 +304,68 @@ static const char *builtin_src(const char *name, int *stage) {
                "  gl_FragDepth = mix(mix(d00, d10, f.x), mix(d01, d11, f.x), f.y);\n"
                "}\n";
     }
+    // FSR 3's inputs from the game's depth (exec.c fsr_run): the camera's motion per pixel - the point at this depth
+    // back to the world (inv: the frame's view-projection without its jitter, inverted, with the depth's range folded
+    // in) and into last frame's view (prev) - as the UV offset to where it was (FSR's convention: current -> previous),
+    // and the depth as a plain float (FSR takes no depth / stencil formats). Points at the far plane (depth 1, w 0 with
+    // the game's infinite projection) move with the camera's rotation only, as directions. Vulkan's texture origin is
+    // top-left; NDC y is up (the game's viewport flip).
+    if (!strcmp(name, "fsr_mv.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { mat4 inv; mat4 prev; } p;\n"
+               "layout(location = 0) out vec2 mv;\n"
+               "layout(location = 1) out float dep;\n"
+               "void main() {\n"
+               "  ivec2 px = ivec2(gl_FragCoord.xy);\n"
+               "  vec2 size = vec2(textureSize(t, 0));\n"
+               "  float d = texelFetch(t, px, 0).r;\n"
+               "  vec2 uv = (vec2(px) + 0.5) / size;\n"
+               "  vec4 w = p.inv * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);\n"
+               "  if (abs(w.w) > 1e-7) w /= w.w; else w.w = 0.0;\n"
+               "  vec4 c = p.prev * w;\n"
+               "  vec2 puv = abs(c.w) > 1e-7 ? vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5) : uv;\n"
+               "  mv = puv - uv;\n"
+               "  dep = d;\n"
+               "}\n";
+    }
+    // FSR 3's motion of what moves by itself (exec.c fsr_velocity): a captured draw replayed from its vertices' clip
+    // positions this frame (c, as rasterized: the same pixels and depth) and last frame (p); per pixel, the offset to
+    // where it was, both without their frame's jitter (j.xy now, j.zw then: NDC). a = this draw's base in c, in p, its
+    // first vertex, vertices per instance; b.x its first instance, b.y a draw that doesn't write depth - effects, glows,
+    // the LED boards' scrolling text (reactive 0.9: FSR trusts this frame there - their look changes with no motion).
+    if (!strcmp(name, "fsr_vel.vert")) {
+        *stage = STAGE_VERTEX;
+        return "#version 450\n"
+               "layout(std430, set = 0, binding = 0) readonly buffer C { vec4 c[]; };\n"
+               "layout(std430, set = 0, binding = 1) readonly buffer P { vec4 p[]; };\n"
+               "layout(push_constant) uniform PC { uvec4 a; uvec4 b; vec4 j; vec4 s; } pc;\n"
+               "layout(location = 0) out vec4 vc;\n"
+               "layout(location = 1) out vec4 vp;\n"
+               "void main() {\n"
+               "  uint i = uint(gl_VertexIndex - int(pc.a.z)) + uint(gl_InstanceIndex - int(pc.b.x)) * pc.a.w;\n"
+               "  vec4 cur = c[pc.a.x + i];\n"
+               "  gl_Position = cur;\n"
+               "  vc = cur;\n"
+               "  vp = p[pc.a.y + i];\n"
+               "}\n";
+    }
+    if (!strcmp(name, "fsr_vel.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(push_constant) uniform PC { uvec4 a; uvec4 b; vec4 j; vec4 s; } pc;\n"
+               "layout(location = 0) in vec4 vc;\n"
+               "layout(location = 1) in vec4 vp;\n"
+               "layout(location = 0) out vec2 mv;\n"
+               "layout(location = 1) out float react;\n"
+               "void main() {\n"
+               "  if (vp.w <= 1e-5 || vc.w <= 1e-5) discard;\n"
+               "  vec2 nc = vc.xy / vc.w - pc.j.xy, np = vp.xy / vp.w - pc.j.zw;\n"
+               "  mv = vec2(np.x - nc.x, nc.y - np.y) * 0.5 * pc.s.xy;\n"
+               "  react = pc.b.y != 0u ? 0.9 : 0.0;\n"
+               "}\n";
+    }
     if (!strcmp(name, "post.vert")) {
         *stage = STAGE_VERTEX;
         return "#version 450\n"

@@ -527,10 +527,13 @@ static void tab_display(void) {
         if (opt_choice("Upscaler", &ui, ups, 2, g_default_upscaler == UPSCALE_BILINEAR ? 0 : 1, ud))
             g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR, g_settings.upscaler_auto = false;
     }
-    static const char *aa[] = {"Off", "SMAA"};
-    opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
+    static const char *aa[] = {"Off", "SMAA", "FSR 3"};
+    opt_choice("Anti-aliasing", &g_settings.antialias, aa, 3, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
-               "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+               "blends only along them, so textures stay sharp. Most useful at a lower internal resolution. FSR 3 "
+               "(experimental): AMD's temporal anti-aliasing of the 3D, built up over several frames - the smoothest "
+               "edges, steadier fine detail; some effects can look softer. Every player's view in split screen too, and "
+               "with any internal resolution, Dynamic included.");
     {   // 3D detail (settings.h DETAIL_*): the game's own dynamic resolution, or its 3D always at the highest
         char autoname[48];
         snprintf(autoname, sizeof autoname, "Automatic (%s)", g_gpu_integrated ? "the game's" : "Full");

@@ -212,7 +212,9 @@ static bool tex_scalable(const NvnTexture *t) {
     if (off) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
-    if (!(a > 1.74f && a < 1.81f)) return false;  // 16:9 (1920x1080 and its fractions, 704x396, 60x33...)
+    // 16:9 (1920x1080 and its fractions, 704x396, 60x33...), or 8:9 - half of it: ARMS's 2-player split screen draws
+    // each player's view at 800x900 (and its bloom chain 400x450, 200x228...), which stayed at 1x at every scale
+    if (!((a > 1.74f && a < 1.81f) || (a > 0.86f && a < 0.91f))) return false;
     return !tex_guest_sized_ao(t);
 }
 

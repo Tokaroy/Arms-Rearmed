@@ -133,5 +133,7 @@ void rec_CmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkIm
 void rec_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout dl, uint32_t n, const VkBufferImageCopy *r);
 void rec_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkBuffer dst, uint32_t n, const VkBufferImageCopy *r);
 void rec_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *cbs);  // (secondaries, ended, of a pool of the caller's)
+// fn(cb, a copy of arg's size bytes) on the recorder, in order (a library recording into cb itself: FSR 3)
+void rec_CmdCall(VkCommandBuffer cb, void (*fn)(VkCommandBuffer, const void *), const void *arg, uint32_t size);
 void rec_CmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t n);
 void rec_CmdWriteTimestamp2(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkQueryPool pool, uint32_t query);

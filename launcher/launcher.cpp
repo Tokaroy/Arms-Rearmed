@@ -184,7 +184,7 @@ static const Choice k_render[] = {{"Match display", "match"}, {"1x (1080p)", "1x
                                   {"4x", "4x"}, {"Dynamic (holds 60 fps)", "dynamic"}, {"75% of the display", "75%"},
                                   {"50% of the display", "50%"}, {"Auto (this GPU's default)", "auto"}};
 static const Choice k_upscaler[] = {{"Auto", "auto"}, {"AMD FSR 1 (sharp)", "fsr1"}, {"Bilinear (soft)", "bilinear"}};
-static const Choice k_aa[] = {{"Off", "off"}, {"SMAA", "smaa"}};
+static const Choice k_aa[] = {{"Off", "off"}, {"SMAA", "smaa"}, {"FSR 3 (experimental)", "fsr3"}};
 static const Choice k_aspect[] = {{"Original 16:9 (bars on wider screens)", "original"}, {"Stretch to the window", "unlocked"}};
 static int choice_index(const Choice *c, int n, const std::string &v) {
     for (int i = 0; i < n; i++) if (v == c[i].value) return i;
@@ -1119,7 +1119,8 @@ static void page_graphics(void) {
     row_label("Frame rate counter", lw);
     ImGui::Checkbox("##fps", &s_show_fps);
     hint("Internal resolution renders the game above (2x, 3x, 4x) or below its own 1080p. Dynamic lowers it on the fly "
-         "to hold 60 fps. F11 or Alt+Enter switches fullscreen in game.");
+         "to hold 60 fps. Anti-aliasing FSR 3 builds each picture over several frames: the smoothest edges, in every "
+         "mode and in split screen. F11 or Alt+Enter switches fullscreen in game.");
     ImGui::Spacing();
     heading("SOUND & CONTROLLER", C_PINK);
     row_label("Volume", lw);

@@ -12,7 +12,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #else
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
-enum { AA_OFF = 0, AA_SMAA = 1 };
+enum { AA_OFF = 0, AA_SMAA = 1, AA_FSR3 = 2 /* AMD FSR 3 native AA, the 3D scene only: runtime/nvn/vulkan/fsr3.cpp */ };
 // 3D detail: the game lowers the resolution of its 3D scene when its GPU timing says the frame is slow (to 1310x737 of
 // a fight's 1600x900, 560x315 per view in 4-player split screen); FULL keeps it at the highest (the timing it reads
 // says the GPU is quick - runtime/nvn/vulkan/exec.c CMD_REPORT_COUNTER). AUTO: full, except on an integrated GPU.

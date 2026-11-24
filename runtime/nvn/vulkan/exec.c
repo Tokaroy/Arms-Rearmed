@@ -3558,6 +3558,33 @@ static VkSpan drv_dedupe(int stage, uint64_t size) {
 }
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
+// FSR 3 (fsr_draw below): the camera's constant buffer (vertex hardware buffer 3, FSR_CAM_SIZE bytes: view 3x4 at
+// float 0, view-projection 4x4 at 12, projection 4x4 at 28, inverse view 3x4 at 44 - rows) of the 3D scene's draws
+// gets this frame's sub-pixel jitter, in the copy the GPU reads: x' = x + jx w, y' = y + jy w (NDC) on both matrices.
+#define FSR_CAM_SIZE 2336
+static bool fsr_jitter_now;        // this draw is the 3D scene's (its pass and its camera)
+static int fsr_cur_view;           // ... of this view (fsr_draw: its camera's order in the frame)
+static float fsr_jx_ndc, fsr_jy_ndc;
+// FSR 3's motion of what moves by itself (fsr_capture_*, below): the 3D scene's depth-writing draws use a vertex
+// shader variant (ShaderKey.capture) that stores each vertex's clip position into a third of a capture buffer;
+// CAPTURE_HEADER_INDEX says where (filled once the draw's vertices are known: fsr_cap_hdr).
+static bool fsr_cap_draw;     // this draw is captured
+static void *fsr_cap_hdr;     // its header (uvec4[2]) in the transient ring
+static VkDescriptorBufferInfo fsr_cap_info(void);
+static VkDescriptorBufferInfo cbuf_jittered(const Range *r, uint64_t size) {
+    float m[FSR_CAM_SIZE / 4];
+    uint64_t n = size < sizeof m ? size : sizeof m;
+    memcpy(m, (const void *)(uintptr_t)r->addr, n);
+    for (int base = 12; base <= 28; base += 16) {  // (view-projection, projection)
+        if ((uint64_t)(base + 16) * 4 > n) break;
+        for (int c = 0; c < 4; c++) {
+            m[base + c] += fsr_jx_ndc * m[base + 12 + c];
+            m[base + 4 + c] += fsr_jy_ndc * m[base + 12 + c];
+        }
+    }
+    return ubo_span(vk_transient_copy(m, n, 256), n);
+}
+
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
@@ -3601,6 +3628,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
+    if (fsr_jitter_now && stage == 0 && idx == 0 && r.size == FSR_CAM_SIZE) return cbuf_jittered(&r, size);
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
@@ -5141,6 +5169,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         } else if (is_ubo(b->type) && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && b->binding == CAPTURE_BUFFER_INDEX) {
+            bi[n] = fsr_cap_info();  // (FSR 3: the vertex positions' capture, the frame's third)
+            w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : gmem_info();
             w[n].pBufferInfo = &bi[n];
@@ -5151,10 +5182,16 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     }
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
-        if (b->set != set || !is_ubo(b->type) || (b->binding != 18 && b->binding != 19 && b->binding != GMAP_BUFFER_INDEX)) continue;
+        if (b->set != set || !is_ubo(b->type) || (b->binding != 18 && b->binding != 19 && b->binding != GMAP_BUFFER_INDEX &&
+                                                  b->binding != CAPTURE_HEADER_INDEX)) continue;
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
-        if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
+        if (b->binding == CAPTURE_HEADER_INDEX) {  // (FSR 3) the capture's header: written once the vertices are known
+            VkSpan hs = vk_transient(32, 256);
+            memset(hs.ptr, 0, 32);  // (nothing stored unless filled)
+            fsr_cap_hdr = hs.ptr;
+            bi[n] = ubo_span(hs, 32);
+        } else if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
             bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
             for (int t = 0; t < si->ntex && t < 64; t++) {  // scale x, y, content part x, y
@@ -5435,6 +5472,7 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
     vkey.flip_y = fkey.flip_y = (r->flags & SR_FLIP_Y) != 0;
     vkey.depth_minus_one = (r->flags & SR_DEPTH_MINUS_ONE) != 0;
     vkey.flip_x = fkey.flip_x = (r->flags & SR_FLIP_X) != 0;
+    vkey.capture = (r->flags & SR_CAPTURE) != 0;
     for (int i = 0; i < r->nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(r->attrib[i] & 0xFF);
     for (int i = 0; i < r->ncolor && i < 8; i++) if (r->color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(r->color[i]);
     uint64_t ck = prog_content_key(r->vs, r->fs, &vkey, &fkey);
@@ -5665,12 +5703,13 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 }
 
 // The draw's state as a variant record (shader_prep.h; as renderer.m: both backends record the same lines)
-static void rec_from_state(ShaderRec *r, bool flip_x, uint32_t mode) {
+static void rec_from_state(ShaderRec *r, bool flip_x, bool capture, uint32_t mode) {
     memset(r, 0, sizeof *r);
     r->kind = 'G';
     r->vs = shader_stage_hash(&st.program->stages[0]);
     r->fs = shader_stage_hash(&st.program->stages[1]);
-    r->flags = (nvn_window_origin() == 0 ? SR_FLIP_Y : 0) | (nvn_depth_mode() == 0 ? SR_DEPTH_MINUS_ONE : 0) | (flip_x ? SR_FLIP_X : 0);
+    r->flags = (nvn_window_origin() == 0 ? SR_FLIP_Y : 0) | (nvn_depth_mode() == 0 ? SR_DEPTH_MINUS_ONE : 0) | (flip_x ? SR_FLIP_X : 0) |
+               (capture ? SR_CAPTURE : 0);
     r->nattrib = (uint8_t)(st.nattrib < 16 ? st.nattrib : 16);
     memcpy(r->attrib, st.attrib, sizeof r->attrib[0] * r->nattrib);
     r->nstream = (uint8_t)(st.nstream < 16 ? st.nstream : 16);
@@ -5910,6 +5949,7 @@ static void prog_wait(Prog *pr) {
     while (atomic_load(&pr->state) == 0 && SDL_GetTicksNS() - t0 < PROG_WAIT_MS * 1000000ull) SDL_DelayNS(100000);
 }
 
+static void fsr_draw(Prog *pr);  // (FSR 3, below)
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { SKIP(SK_NO_PROGRAM); return; }
@@ -5920,6 +5960,9 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    extern bool fsr_want_capture(void);
+    vkey.capture = fsr_cap_draw = fsr_want_capture();  // (FSR 3: this draw's vertex positions for its motion)
+    fsr_cap_hdr = NULL;
     Prog *pr = get_program(st.program, &vkey, &fkey);
     prog_wait(pr);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(!pr ? SK_NO_STAGES : atomic_load(&pr->state) == 2 ? SK_PROG_FAILED : SK_PROG_BUILDING); return; }
@@ -5993,6 +6036,7 @@ static void draw_(CmdRec *r, bool indexed) {
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
+    fsr_draw(pr);  // (FSR 3: this draw's jitter; the frame's FSR before the first draw sampling the finished scene)
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
 
@@ -6037,7 +6081,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!pp) {
             if (shader_rec_recording()) {
                 ShaderRec rec;
-                rec_from_state(&rec, vkey.flip_x, mode);
+                rec_from_state(&rec, vkey.flip_x, vkey.capture, mode);
                 shader_rec_note(&rec);
             }
             pp = prep_pipes_n ? PREP_GET(prep_pipes, ph) : NULL;  // prepared before the game
@@ -6047,7 +6091,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 shader_first_visit("pipeline", vh, fh, ph);
                 if (prep_check_on()) {
                     ShaderRec rec;
-                    rec_from_state(&rec, vkey.flip_x, mode);
+                    rec_from_state(&rec, vkey.flip_x, vkey.capture, mode);
                     prep_check(&k, vh, fh, &rec);
                 }
                 pp = calloc(1, sizeof *pp);
@@ -6452,6 +6496,21 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     if (!nruns) { run_at[0] = 0; run_n[0] = inst; nruns = 1; run_gold[0] = false; }
+    if (fsr_cap_draw && fsr_cap_hdr && !g_ind.on && cls == 2) {  // (FSR 3) where its vertices go, and the draw to replay
+        extern void fsr_capture_draw(void *hdr, bool use_index, VkSpan ib, VkIndexType it, const void *isrc, uint32_t isz,
+                                     uint32_t icount, uint32_t count, uint32_t first, int32_t base_vertex, uint32_t max_index,
+                                     bool max_known, uint32_t inst, uint32_t base_inst, VkPrimitiveTopology topo, uint64_t key);
+        uint64_t key = hmix(1469598103934665603ull, &st.program->stages[0].code_addr, 8);
+        key = hmix(key, &st.program->stages[1].code_addr, 8);
+        key = hmix(key, &r->x[3], 8);  // (index buffer / first instance)
+        key = hmix(key, &count, 4);
+        key = hmix(key, &base_vertex, 4);
+        key = hmix(key, &inst, 4);
+        key = hmix(key, &st.vbuf[0].addr, 8);
+        fsr_capture_draw(fsr_cap_hdr, use_index, ib, itype_vk, indexed ? (const void *)(uintptr_t)r->x[3] : NULL,
+                         indexed ? ((uint32_t)r->x[1] == 1 ? 2u : (uint32_t)r->x[1] == 2 ? 4u : 1u) : 0u, icount, count, first,
+                         base_vertex, max_index, !scan_src, inst, base_inst, topo, key);
+    }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[RECOLOUR_TINT_FLOATS] = {0};
@@ -7220,6 +7279,702 @@ static void post_pass_ex(VkCommandBuffer cb, const char *fs, const VkImageView *
     rec_CmdEndRendering(cb);
 }
 
+// ================================================================== AMD FSR 3, native AA (Anti-aliasing "FSR 3")
+// ARMS draws its 3D scene into an HDR colour target (B10G11R11) with a depth buffer, then tone-maps it (with bloom
+// from a copy) and draws the HUD over the result. FSR 3 goes between the two: the scene's draws are jittered
+// (cbuf_jittered: the camera's matrices in the copy the GPU reads), and before the first draw that samples the scene's
+// colour from outside the scene (bloom's downsample, then the tone-map) the camera's motion is worked out per pixel
+// from its depth and this and last frame's view-projection (fsr_mv.frag), what moves by itself is drawn over it from
+// its captured vertex positions (fsr_velocity, below), FSR 3 accumulates the frames (fsr3.cpp), and its output
+// replaces the scene's colour. The HUD stays out of it. Per view (split screen: FsrView), and on the part of the images
+// drawn (Dynamic resolution: their top-left part). docs/CHANGES.md "AMD FSR 3 anti-aliasing" has the whole design.
+#include "fsr3.h"
+// FSR 3 chosen but it can't run here (AMD's DLLs missing, no context, a scene format it doesn't take): SMAA instead
+// (post_process), not no anti-aliasing at all
+static bool fsr_unusable;
+bool fsr_fallback_smaa(void) { return g_settings.antialias == AA_FSR3 && (fsr_unusable || !fsr3_load()); }
+// A view: one camera's 3D scene - the whole screen in 1P, each player's part in split screen. ARMS draws each view
+// through its own targets, scene to tone map (800x900 in 2P, 800x450 in 3P / 4P; the views of a frame may share the
+// images, drawn one after another), and in 3P / 4P only two views a frame, the others the next (each player's part
+// updates at 30 fps). A view is followed by its camera (fsr_view_of: the nearest of the views' last cameras); its
+// history (FSR's, the camera's, its draws' vertex positions) is from the last frame it was drawn in, whichever that was.
+// Each has its own FSR 3 context (fsr3.cpp) and its own jitter sequence (advancing when it's drawn).
+#define FSR_VIEWS 4
+typedef struct {
+    uint64_t cam_addr;           // its camera buffer the last time (double-buffered by the game; 0: a free slot)
+    uint64_t last_frame;         // the last frame it was drawn in
+    bool seen;                   // drawn this frame
+    float cam[64];               // its camera this frame (unjittered: from guest memory)
+    TexBackend *color, *depth;   // its scene colour and depth this frame (its largest HDR target)
+    uint32_t w, h;               // its scene's size: the jitter's pixels (every pass of the view, half-size ones too)
+    bool done;                   // FSR ran for it this frame
+    float jx, jy, pjx, pjy;      // its jitter (pixels) this time and the last time it was drawn
+    uint32_t nrend;              // times drawn (its jitter phase)
+    float dt_ms;                 // since the last time it was drawn
+    uint64_t last_ns;
+    float prev_vp[16];           // the last time's view-projection (row-major), camera position, size, depth image
+    float prev_pos[3];
+    bool have_prev;
+    uint32_t prev_w, prev_h;
+    TexBackend *prev_depth;
+} FsrView;
+static struct {
+    uint64_t frame;              // the frame this state is for (vk_frame_counter)
+    bool active;                 // jittering and running this frame
+    FsrView v[FSR_VIEWS];
+    int nviews;                  // views drawn this frame
+    int log_n;
+} fsr;
+
+// ---- what moves by itself: vertex positions captured each frame, matched to the view's last time
+// The capture buffer has three thirds: frame f writes third f % 3; a view's replay reads the third of the last frame it
+// was drawn in, f - 1, or f - 2 in 3P / 4P (frame f + 1 is the first to write that third again, after this frame's
+// GPU work). Each captured draw is recorded with an identity (its view, shaders, buffers, counts, and how many identical
+// draws came before it in the view) and its indices (a copy in a ring of the frame's own: the transient ring's may be
+// reused before the replay).
+#define CAP_VERTS (1u << 21)          // vertices per third (32 MB of vec4)
+#define CAP_IDX_BYTES (8u << 20)      // index bytes a frame
+#define CAP_DRAWS 2048
+typedef struct {
+    uint64_t okey, key;              // its identity without / with its order among identical draws
+    uint32_t base, nverts, inst, base_inst, first_vertex;  // in the capture third: base .. base + nverts * inst
+    uint32_t icount, count, ioff;    // ioff: in the frame's index ring (use_index)
+    int32_t base_vertex;
+    VkIndexType it;
+    bool use_index, restart;
+    bool blended;                    // doesn't write depth: reactive only (no motion of its own)
+    VkPrimitiveTopology topo;
+    TexBackend *depth;
+    int view;                        // its view (split screen: the views may share their images)
+    int32_t prev_base;               // matched: the view's last time's vertices, in the whole buffer (-1: none)
+} CapDraw;
+static struct {
+    VkBuffer buf; VmaAllocation mem;           // capture, 3 thirds
+    VkBuffer ibuf[3]; VmaAllocation imem[3]; uint8_t *iptr[3];  // index rings
+    bool ok, failed;
+    int third;                                 // this frame's
+    uint32_t used, iused;
+    CapDraw d[CAP_DRAWS]; int n;               // this frame's draws
+    uint64_t d_frame;                          // ... their frame
+    struct { uint64_t key; uint32_t base, nverts; } vprev[FSR_VIEWS][CAP_DRAWS];  // each view's last time (base: in the
+    int nvprev[FSR_VIEWS];                                                           //  whole buffer), and its frame
+    uint64_t vprev_frame[FSR_VIEWS];
+    uint64_t stat_matched, stat_drawn;
+} cap;
+
+static bool cap_init(void) {
+    if (cap.ok || cap.failed) return cap.ok;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)CAP_VERTS * 16 * 3,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &cap.buf, &cap.mem, NULL) != VK_SUCCESS) { cap.failed = true; return false; }
+    for (int i = 0; i < 3; i++) {
+        VkBufferCreateInfo ib = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = CAP_IDX_BYTES, .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
+        VmaAllocationCreateInfo ia = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo inf;
+        if (vmaCreateBuffer(g_vk.vma, &ib, &ia, &cap.ibuf[i], &cap.imem[i], &inf) != VK_SUCCESS || !inf.pMappedData) {
+            cap.failed = true;
+            return false;
+        }
+        cap.iptr[i] = inf.pMappedData;
+    }
+    cap.ok = true;
+    LOG("[fsr3] vertex capture: %u vertices a frame\n", CAP_VERTS);
+    return true;
+}
+
+static VkDescriptorBufferInfo fsr_cap_info(void) {
+    if (!cap.ok) return gmem_info();  // (no capture: never chosen then - fsr_want_capture)
+    return (VkDescriptorBufferInfo){cap.buf, (VkDeviceSize)cap.third * CAP_VERTS * 16, (VkDeviceSize)CAP_VERTS * 16};
+}
+
+// (frame roll) the ending frame's draws become their views' last time (views not drawn in it keep theirs)
+static void cap_roll(uint64_t frame) {
+    bool drawn[FSR_VIEWS] = {0};
+    for (int i = 0; i < cap.n; i++) {
+        int v = cap.d[i].view;
+        if (v < 0 || v >= FSR_VIEWS) continue;
+        if (!drawn[v]) drawn[v] = true, cap.nvprev[v] = 0, cap.vprev_frame[v] = cap.d_frame;
+        if (cap.nvprev[v] >= CAP_DRAWS) continue;
+        cap.vprev[v][cap.nvprev[v]].key = cap.d[i].key;
+        cap.vprev[v][cap.nvprev[v]].base = (uint32_t)cap.third * CAP_VERTS + cap.d[i].base;
+        cap.vprev[v][cap.nvprev[v]].nverts = cap.d[i].nverts * cap.d[i].inst;
+        cap.nvprev[v]++;
+    }
+    cap.n = 0;
+    cap.d_frame = frame;
+    cap.used = cap.iused = 0;
+    cap.third = (int)(frame % 3);
+}
+
+void fsr_capture_draw(void *hdr, bool use_index, VkSpan ib, VkIndexType it, const void *isrc, uint32_t isz, uint32_t icount,
+                      uint32_t count, uint32_t first, int32_t base_vertex, uint32_t max_index, bool max_known, uint32_t inst,
+                      uint32_t base_inst, VkPrimitiveTopology topo, uint64_t key) {
+    uint32_t *h = hdr;
+    if (!cap.ok || cap.n >= CAP_DRAWS) return;
+    key = hmix(key, &fsr_cur_view, sizeof fsr_cur_view);  // (its view: each view's draws matched among its own)
+    // the vertices it can reach: gl_VertexIndex - first vertex in [0, nverts)
+    uint32_t first_vertex, nverts;
+    if (!isrc) {  // (not indexed: first .. first + count; expanded to indices from `first` when not native)
+        first_vertex = first, nverts = count;
+    } else {
+        uint32_t mx = 0;
+        if (max_known) mx = max_index - (base_vertex > 0 ? (uint32_t)base_vertex : 0u);  // (max + 1)
+        else {  // (the index buffer read in place: its largest index)
+            if (isz == 2) { const uint16_t *s = isrc; for (uint32_t i = 0; i < count; i++) if (s[i] != 0xFFFF && s[i] >= mx) mx = s[i] + 1u; }
+            else if (isz == 4) { const uint32_t *s = isrc; for (uint32_t i = 0; i < count; i++) if (s[i] != 0xFFFFFFFFu && s[i] >= mx) mx = s[i] + 1u; }
+        }
+        first_vertex = (uint32_t)base_vertex, nverts = mx;
+    }
+    if (!nverts || (uint64_t)cap.used + (uint64_t)nverts * inst > CAP_VERTS) return;
+    // the indices it was drawn with, for the replay
+    uint32_t ioff = 0, ibytes = 0;
+    const void *idata = NULL;
+    if (use_index) {
+        uint32_t esz = it == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+        ibytes = icount * esz;
+        idata = ib.ptr ? ib.ptr : isrc;  // (transient copies have their pointer; a buffer read in place, the guest's)
+        if (!idata || cap.iused + ibytes + 4 > CAP_IDX_BYTES) return;
+        ioff = (cap.iused + 3) & ~3u;
+        memcpy(cap.iptr[cap.third] + ioff, idata, ibytes);
+        cap.iused = ioff + ibytes;
+    }
+    h[0] = first_vertex, h[1] = nverts, h[2] = base_inst, h[3] = nverts * inst;
+    h[4] = cap.used;
+    // this draw's identity: how many identical ones came before it in the frame and view (the same mesh drawn twice)
+    int ord = 0;
+    for (int i = 0; i < cap.n; i++) ord += cap.d[i].okey == key;
+    uint64_t k = hmix(key, &ord, 4);
+    CapDraw *d = &cap.d[cap.n++];
+    *d = (CapDraw){.okey = key, .key = k, .base = cap.used, .nverts = nverts, .inst = inst, .base_inst = base_inst, .first_vertex = first_vertex,
+                   .icount = icount, .count = count, .ioff = ioff, .base_vertex = base_vertex, .it = it, .use_index = use_index,
+                   .topo = topo, .restart = topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && st.prim_restart,
+                   .depth = st.rt.depth ? st.rt.depth->backend : NULL, .view = fsr_cur_view, .prev_base = -1,
+                   .blended = !(st.ds[0] && st.ds[1])};
+    int sv = fsr_cur_view;  // (its view's last time: its third not written again yet - at most 2 frames ago)
+    if (sv >= 0 && sv < FSR_VIEWS && cap.nvprev[sv] && fsr.frame - cap.vprev_frame[sv] <= 2)
+        for (int i = 0; i < cap.nvprev[sv]; i++)
+            if (cap.vprev[sv][i].key == k && cap.vprev[sv][i].nverts == nverts * inst) {
+                d->prev_base = (int32_t)cap.vprev[sv][i].base;
+                break;
+            }
+    cap.used += nverts * inst;
+}
+
+static bool fsr_scene_pass(void) {  // the 3D scene's passes: its 16:9 depth target, and no colour or the HDR one
+    if (!st.rt.depth || !st.rt.depth->backend || !((TexBackend *)st.rt.depth->backend)->scalable) return false;
+    if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format != 0x3f) return false;
+    return true;
+}
+
+static void fsr_frame_roll(void) {
+    uint64_t f = vk_frame_counter();
+    if (f == fsr.frame) return;
+    fsr.frame = f;
+    static int vlog = -1;  // LARECOMP_FSR_LOG=1: every second, the last frame's views
+    if (vlog < 0) vlog = getenv("LARECOMP_FSR_LOG") != NULL;
+    if (vlog && fsr.active && f % 60 < 4) {
+        char line[512];
+        int o = snprintf(line, sizeof line, "[fsr3] frame %llu: %d views:", (unsigned long long)f - 1, fsr.nviews);
+        for (int i = 0; i < FSR_VIEWS && o < (int)sizeof line - 80; i++)
+            if (fsr.v[i].seen) o += snprintf(line + o, sizeof line - o, " [cam %llx %ux%u colour %p depth %p%s%s]", (unsigned long long)fsr.v[i].cam_addr,
+                          fsr.v[i].w, fsr.v[i].h, (void *)fsr.v[i].color, (void *)fsr.v[i].depth, fsr.v[i].done ? " ran" : "",
+                          fsr.v[i].have_prev ? "" : " no history");
+        LOG("%s\n", line);
+    }
+    cap_roll(f);
+    fsr.nviews = 0;
+    for (int i = 0; i < FSR_VIEWS; i++) {
+        FsrView *v = &fsr.v[i];
+        v->seen = false, v->color = v->depth = NULL, v->w = v->h = 0, v->done = false;
+    }
+    bool was = fsr.active;
+    {   // (test) LARECOMP_TEST_FSR_AT=<frame>: anti-aliasing turned to FSR 3 then, as the Video tab would
+        static long at = -1;
+        if (at < 0) at = getenv("LARECOMP_TEST_FSR_AT") ? atol(getenv("LARECOMP_TEST_FSR_AT")) : 0;
+        static bool fired;
+        if (at > 0 && !fired && f >= (uint64_t)at)
+            fired = true, g_settings.antialias = AA_FSR3, LOG("[fsr3] test: anti-aliasing FSR 3 from frame %llu\n", (unsigned long long)f);
+    }
+    fsr.active = g_settings.antialias == AA_FSR3 && !fsr_unusable && fsr3_load();
+    if (!fsr.active || !was)  // (off, or just turned on: every view starts over)
+        for (int i = 0; i < FSR_VIEWS; i++) fsr.v[i].cam_addr = 0, fsr.v[i].have_prev = false, cap.nvprev[i] = 0;
+    if (fsr.active && !was) {  // (turned on in game: its shader variants, if the start's preparation didn't make them)
+        extern void shader_prep_capture_background(void);
+        shader_prep_capture_background();
+    }
+}
+
+// (draw_, before its program is chosen) this draw is captured: the 3D scene's, with its camera. Those writing depth
+// give their motion; the others (blended effects, glows, scrolling boards) mark FSR's reactive mask.
+// LARECOMP_FSR_NO_OBJECTS=1: camera motion only (A/B).
+bool fsr_want_capture(void) {
+    fsr_frame_roll();
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_FSR_NO_OBJECTS") != NULL;
+    if (off || !g_vk.vertex_stores || !fsr.active || !st.program || !fsr_scene_pass()) return false;
+    Range cam = st.ubuf[0][0];
+    return cam.addr && cam.size == FSR_CAM_SIZE && cap_init();
+}
+
+// row-major 4x4 inverse (doubles); false: singular
+static bool inv4(const double m[16], double o[16]) {
+    double a[16];
+    a[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    a[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    a[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    a[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    a[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    a[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    a[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    a[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    a[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    a[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    a[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    a[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    a[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    a[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    a[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    a[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    double det = m[0] * a[0] + m[1] * a[4] + m[2] * a[8] + m[3] * a[12];
+    if (fabs(det) < 1e-30) return false;
+    for (int i = 0; i < 16; i++) o[i] = a[i] / det;
+    return true;
+}
+
+// FSR's helper images at the scene's size: 0 motion (R16G16F), 1 depth (R32F), 2 output (R16G16B16A16F, storage),
+// 3 reactive mask (R8)
+static TexBackend *fsr_image(int i, uint32_t w, uint32_t h) {
+    static TexBackend img[4];
+    static const VkFormat fmt[4] = {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8_UNORM};
+    TexBackend *d = &img[i];
+    if (d->image && (d->width != w || d->height != h)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE;
+        d->mem = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                              (i != 2 ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt[i],
+                                .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = u};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        d->format = fmt[i]; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        vk_image_init_layout(vk_cmd(), d->image, d->aspect);
+    }
+    return d;
+}
+
+static VkPipelineLayout fsr_mv_layout;
+static VkPipeline fsr_mv_pipeline(void) {
+    static VkPipeline p;
+    if (p) return p;
+    post_layout_init();
+    VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128};
+    VkPipelineLayoutCreateInfo lci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                      .pSetLayouts = &post_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+    VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &lci, NULL, &fsr_mv_layout));
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_builtin_shader("post.vert"), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_builtin_shader("fsr_mv.frag"), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba[2] = {{.colorWriteMask = 0xF}, {.colorWriteMask = 0xF}};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 2,
+                                              .pAttachments = cba};
+    VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    uint32_t ndyn = 2;
+    fullscreen_vertex_dyn(dyn, &ndyn, 3);
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = ndyn, .pDynamicStates = dyn};
+    VkFormat fmts[2] = {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 2,
+                                        .pColorAttachmentFormats = fmts};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = fsr_mv_layout};
+    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    return p;
+}
+
+// The replay of this frame's captured draws that were matched to last frame's (fsr_vel.vert / .frag): over the
+// camera's motion in mv, where they are the nearest surface (depth test against the scene's, no write).
+static VkPipelineLayout fsr_vel_layout;
+static VkDescriptorSetLayout fsr_vel_set_layout;
+static VkPipeline fsr_vel_pipeline(VkFormat depth_fmt, bool react_only) {
+    static VkPipeline pp[2];
+    static VkFormat pf[2];
+    VkPipeline p = pp[react_only];
+    if (p && pf[react_only] == depth_fmt) return p;
+    if (!fsr_vel_layout) {
+        VkDescriptorSetLayoutBinding b[2];
+        for (uint32_t i = 0; i < 2; i++)
+            b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &fsr_vel_set_layout));
+        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &fsr_vel_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &fsr_vel_layout));
+    }
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+         .module = vk_builtin_shader("fsr_vel.vert"), .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+         .module = vk_builtin_shader("fsr_vel.frag"), .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendAttachmentState cba[2] = {{.colorWriteMask = react_only ? 0u : 0x3u}, {.colorWriteMask = 0x1}};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 2,
+                                              .pAttachments = cba};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                                                .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_FALSE,
+                                                .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL};
+    VkDynamicState dyn[4] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+                             VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 4, .pDynamicStates = dyn};
+    VkFormat cf[2] = {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R8_UNORM};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 2,
+                                        .pColorAttachmentFormats = cf, .depthAttachmentFormat = depth_fmt};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
+                                       .pColorBlendState = &cb, .pDynamicState = &dy, .layout = fsr_vel_layout};
+    VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    pp[react_only] = p, pf[react_only] = depth_fmt;
+    return p;
+}
+
+static bool fsr_no_reactive(void) {  // LARECOMP_FSR_NO_REACTIVE=1: no reactive mask (A/B)
+    static int v = -1;
+    if (v < 0) v = getenv("LARECOMP_FSR_NO_REACTIVE") != NULL;
+    return v;
+}
+// (w, h: the images' size; cw, ch: the part drawn this frame - Dynamic resolution's; the whole of them otherwise)
+static void fsr_velocity(VkCommandBuffer cb, int vi, TexBackend *depth, TexBackend *mv, TexBackend *react, uint32_t w, uint32_t h,
+                         uint32_t cw, uint32_t ch) {
+    const FsrView *vw = &fsr.v[vi];
+    const float j[4] = {2.0f * vw->jx / (float)cw, -2.0f * vw->jy / (float)ch, 2.0f * vw->pjx / (float)cw, -2.0f * vw->pjy / (float)ch};
+    int n = 0, nb = 0;
+    for (int i = 0; i < cap.n; i++) {
+        if (cap.d[i].depth != depth || cap.d[i].view != vi) continue;
+        if (cap.d[i].blended) nb++;
+        else n += cap.d[i].prev_base >= 0;
+    }
+    cap.stat_drawn += (uint64_t)cap.n, cap.stat_matched += (uint64_t)n;
+    if (fsr_no_reactive()) nb = 0;
+    VkPipeline pipe = fsr_vel_pipeline(depth->format, false), pipe_b = fsr_vel_pipeline(depth->format, true);  // (before the rendering)
+    static const VkComponentMapping id = {0};
+    VkRenderingAttachmentInfo ca[2] = {
+        {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(mv), .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE},
+        {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(react), .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE}};  // (cleared: nothing reactive)
+    VkRenderingAttachmentInfo da = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                                    .imageView = vk_image_view(depth, VK_IMAGE_VIEW_TYPE_2D, depth->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT),
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {cw, ch}}, .layerCount = 1,
+                          .colorAttachmentCount = 2, .pColorAttachments = ca, .pDepthAttachment = &da};
+    rec_CmdBeginRendering(cb, &ri);
+    if (!n && !nb) { rec_CmdEndRendering(cb); return; }
+    VkDescriptorSet ds = vk_alloc_set(fsr_vel_set_layout);
+    VkDescriptorBufferInfo bi[2] = {{cap.buf, (VkDeviceSize)cap.third * CAP_VERTS * 16, (VkDeviceSize)CAP_VERTS * 16},
+                                    {cap.buf, 0, (VkDeviceSize)CAP_VERTS * 16 * 3}};  // (this frame's third; the whole buffer)
+    VkWriteDescriptorSet wr[2];
+    for (int i = 0; i < 2; i++)
+        wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = (uint32_t)i,
+                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    rec_UpdateDescriptorSets(2, wr);
+    VkViewport v = {0, (float)ch, (float)cw, -(float)ch, 0, 1};  // (as the game's draws: NDC y up, the drawn part)
+    VkRect2D sc = {{0, 0}, {cw, ch}};
+    rec_CmdSetViewport(cb, 0, 1, &v);
+    rec_CmdSetScissor(cb, 0, 1, &sc);
+    int bound = -1;
+    for (int pass = 0; pass < 2; pass++)
+    for (int i = 0; i < cap.n; i++) {
+        CapDraw *d = &cap.d[i];
+        if (d->depth != depth || d->view != vi || d->blended != (pass == 1) || (pass == 0 && d->prev_base < 0) || (pass == 1 && !nb)) continue;
+        if (bound != pass) {
+            rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pass ? pipe_b : pipe);
+            rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fsr_vel_layout, 0, 1, &ds, 0, NULL);
+            bound = pass;
+        }
+        struct { uint32_t a[4], b[4]; float j[4], s[4]; } pc = {
+            {d->base, pass ? (uint32_t)cap.third * CAP_VERTS + d->base : (uint32_t)d->prev_base, d->first_vertex, d->nverts},
+            {d->base_inst, pass == 1, 0, 0}, {j[0], j[1], j[2], j[3]}, {(float)cw / (float)w, (float)ch / (float)h, 0, 0}};
+        rec_CmdPushConstants(cb, fsr_vel_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
+        rec_CmdSetPrimitiveTopology(cb, d->topo);
+        rec_CmdSetPrimitiveRestartEnable(cb, d->use_index && d->restart);
+        if (d->use_index) {
+            rec_CmdBindIndexBuffer(cb, cap.ibuf[cap.third], d->ioff, d->it);
+            rec_CmdDrawIndexed(cb, d->icount, d->inst, 0, d->base_vertex, d->base_inst);
+        } else {
+            rec_CmdDraw(cb, d->count, d->inst, d->first_vertex, d->base_inst);
+        }
+    }
+    rec_CmdEndRendering(cb);
+}
+
+static void image_discard_to_general(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect) {  // (contents not kept)
+    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                               .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .image = img, .subresourceRange = {aspect, 0, 1, 0, 1}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    rec_CmdPipelineBarrier2(cb, &di);
+}
+
+static void fsr_run(int vi) {
+    FsrView *vw = &fsr.v[vi];
+    vw->done = true;
+    TexBackend *c = vw->color, *d = vw->depth;
+    if (!c || !d || c->width != d->width || c->height != d->height) return;
+    uint32_t color_fmt = fsr3_format_of(c->format);
+    if (!color_fmt) {
+        static int nlog;
+        if (!nlog++) LOG("[fsr3] the scene's colour format %d isn't one FSR 3 takes here: SMAA instead\n", c->format);
+        fsr.active = false, fsr_unusable = true;
+        return;
+    }
+    uint32_t w = c->width, h = c->height;
+    // Dynamic resolution: the frame is drawn into the images' top-left part (cw x ch) - FSR works on that part, the rest
+    // of each image is left as it is; elsewhere the part is the whole
+    uint32_t cw = (uint32_t)content_extent((int)w, c->scalable, c->sx, c->ax), ch = (uint32_t)content_extent((int)h, c->scalable, c->sy, c->ay);
+    float kx = (float)w / (float)cw, ky = (float)h / (float)ch;
+    {   // the context: as large as this resolution setting's largest scene (the game's 1920x1080 at the allocation scale),
+        // so it isn't made again, larger, in a fight (a wait for the GPU: a 35 ms frame); the dispatch passes the size
+        uint32_t mw = (uint32_t)lroundf(1920.0f * (c->ax > 0 ? c->ax : 1)), mh = (uint32_t)lroundf(1080.0f * (c->ay > 0 ? c->ay : 1));
+        if (!fsr3_context(vi, mw > w ? mw : w, mh > h ? mh : h)) { fsr.active = false, fsr_unusable = true; return; }
+    }
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    // the camera: this frame's view-projection (unjittered), last frame's; a cut (a big jump of the camera, a new
+    // size, the first frame) starts FSR's history over
+    float vp[16], pos[3] = {vw->cam[47], vw->cam[51], vw->cam[55]};
+    memcpy(vp, vw->cam + 12, sizeof vp);
+    bool reset = !vw->have_prev || vw->prev_w != cw || vw->prev_h != ch || vw->prev_depth != d;  // (Dynamic: a step)
+    if (vw->have_prev) {
+        float dx = pos[0] - vw->prev_pos[0], dy = pos[1] - vw->prev_pos[1], dz = pos[2] - vw->prev_pos[2];
+        if (dx * dx + dy * dy + dz * dz > 40.0f * 40.0f) reset = true;
+    }
+    const float *pvp = reset ? vp : vw->prev_vp;
+    double m[16], inv[16];
+    for (int i = 0; i < 16; i++) m[i] = vp[i];
+    if (!inv4(m, inv)) return;
+    // fsr_mv.frag works in the images' uv (its pixel over their size); the camera's NDC spans the drawn part: the inverse
+    // takes the images' NDC to the drawn part's first (x k + (k - 1), y k + (1 - k)), and last frame's view-projection
+    // gives the images' NDC (the inverse of that), so the motion comes out in the images' uv, as FSR is told
+    if (kx != 1.0f || ky != 1.0f)
+        for (int r = 0; r < 4; r++) {
+            inv[r * 4 + 3] += inv[r * 4 + 0] * (kx - 1.0) + inv[r * 4 + 1] * (1.0 - ky);
+            inv[r * 4 + 0] *= kx;
+            inv[r * 4 + 1] *= ky;
+        }
+    float pvs[16];
+    memcpy(pvs, pvp, sizeof pvs);
+    if (kx != 1.0f || ky != 1.0f)
+        for (int col = 0; col < 4; col++) {
+            pvs[0 * 4 + col] = (pvs[0 * 4 + col] - (kx - 1.0f) * pvs[3 * 4 + col]) / kx;
+            pvs[1 * 4 + col] = (pvs[1 * 4 + col] - (1.0f - ky) * pvs[3 * 4 + col]) / ky;
+        }
+    // depth -> NDC z: the game's depth range (0..1, or -1..1 written as 0..1 by the translated shaders)
+    bool minus_one = nvn_depth_mode() == 0;
+    float pc[32];  // two mat4, column-major for GLSL: inv (with the depth's range folded in), prev
+    for (int r = 0; r < 4; r++)
+        for (int col = 0; col < 4; col++) {
+            double v = inv[r * 4 + col];
+            if (minus_one && col == 2) v *= 2.0;                       // (z_ndc = 2d - 1: column 2 x 2 ...)
+            if (minus_one && col == 3) v -= inv[r * 4 + 2];             // (... and -1 x column 2 into column 3)
+            pc[col * 4 + r] = (float)v;
+            pc[16 + col * 4 + r] = pvs[r * 4 + col];
+        }
+    TexBackend *mv = fsr_image(0, w, h), *dep = fsr_image(1, w, h), *out = fsr_image(2, w, h), *react = fsr_image(3, w, h);
+    vk_full_barrier(cb);
+    image_discard_to_general(cb, mv->image, VK_IMAGE_ASPECT_COLOR_BIT);
+    image_discard_to_general(cb, dep->image, VK_IMAGE_ASPECT_COLOR_BIT);
+    {   // the motion and depth images (fsr_mv.frag)
+        VkPipeline pipe = fsr_mv_pipeline();
+        static const VkComponentMapping id = {0};
+        VkRenderingAttachmentInfo ca[2];
+        for (int i = 0; i < 2; i++)
+            ca[i] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(i ? dep : mv),
+                                                .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                                                .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {cw, ch}}, .layerCount = 1,
+                              .colorAttachmentCount = 2, .pColorAttachments = ca};
+        rec_CmdBeginRendering(cb, &ri);
+        VkDescriptorSet ds = vk_alloc_set(post_set_layout);
+        VkDescriptorImageInfo ii = {vk_default_sampler(false), vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id,
+                                                                             VK_IMAGE_ASPECT_DEPTH_BIT), VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+                                   .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+        rec_UpdateDescriptorSets(1, &wr);
+        rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, fsr_mv_layout, 0, 1, &ds, 0, NULL);
+        VkViewport v = {0, 0, (float)w, (float)h, 0, 1};  // (the images' pixels; only the drawn part)
+        VkRect2D sc = {{0, 0}, {cw, ch}};
+        rec_CmdSetViewport(cb, 0, 1, &v);
+        rec_CmdSetScissor(cb, 0, 1, &sc);
+        rec_CmdPushConstants(cb, fsr_mv_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128, pc);
+        fullscreen_vertex_bind(cb);
+        rec_CmdDraw(cb, 3, 1, 0, 0);
+        rec_CmdEndRendering(cb);
+    }
+    vk_full_barrier(cb);
+    fsr_velocity(cb, vi, d, mv, react, w, h, cw, ch);  // (what moves by itself, over the camera's motion)
+    vk_full_barrier(cb);
+    // FSR 3 (on the recorder, into this command buffer)
+    float p11 = vw->cam[28 + 5], p23 = vw->cam[28 + 11];
+    Fsr3Args a = {.color = c->image, .depth = dep->image, .mv = mv->image, .out = out->image, .reactive = react->image,
+                  .color_ffx_fmt = color_fmt, .w = w, .h = h, .rw = cw, .rh = ch, .jitter_x = vw->jx, .jitter_y = vw->jy,
+                  .near_plane = p23 < 0 ? -p23 : 0.1f, .far_plane = vw->cam[57] > 1 ? vw->cam[57] : 1e5f,
+                  .fov_y = p11 > 0 ? 2.0f * atanf(1.0f / p11) : 1.0f,
+                  .dt_ms = vw->dt_ms, .reset = reset, .slot = vi,
+                  .sharpen = 0, .sharpness = 0};
+    rec_CmdCall(cb, fsr3_dispatch, &a, sizeof a);
+    vk_full_barrier(cb);
+    // its output into the scene's colour (FSR may have left that image in another layout: its contents go anyway)
+    image_discard_to_general(cb, c->image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int)cw, (int)ch, 1}},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int)cw, (int)ch, 1}}};
+    rec_CmdBlitImage(cb, out->image, VK_IMAGE_LAYOUT_GENERAL, c->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+    vk_full_barrier(cb);
+    ss_forget();  // (pipeline, sets and dynamic state are ours now: the game's next draw records its own again)
+    memcpy(vw->prev_vp, vp, sizeof vp);
+    memcpy(vw->prev_pos, pos, sizeof pos);
+    vw->have_prev = true;
+    vw->prev_w = cw, vw->prev_h = ch, vw->prev_depth = d;
+    if (fsr.log_n++ < 3 * FSR_VIEWS || fsr.frame % 600 == 0) {
+        int matched = 0, changed = 0;
+        for (int i = 0; i < cap.n; i++)
+            if (cap.d[i].view == vi && cap.d[i].depth == d) matched += cap.d[i].prev_base >= 0, changed += cap.d[i].blended;
+        LOG("[fsr3] frame %llu view %d (%d drawn so far): %ux%u, jitter %.3f %.3f px%s; %d draws captured (%u vertices), %d matched last "
+            "frame's in this view (%d effects: reactive)\n", (unsigned long long)fsr.frame, vi + 1, fsr.nviews, cw, ch,
+            vw->jx, vw->jy, reset ? " (history reset)" : "", cap.n, cap.used, matched, changed);
+    }
+}
+
+// The view of the camera buffer at addr (-1: more views this frame than FSR_VIEWS). A camera not seen before takes a
+// free slot, else the one drawn longest ago (its history starts over).
+static int fsr_view_of(uint64_t addr) {
+    int vi = -1;
+    for (int i = 0; i < FSR_VIEWS && vi < 0; i++) if (fsr.v[i].seen && fsr.v[i].cam_addr == addr) vi = i;  // (this frame)
+    if (vi < 0) {
+        // a camera first seen this frame: the view whose last camera is nearest (position, and direction: the view
+        // matrix's third row), drawn lately and not yet this frame. The game double-buffers its camera buffers (1P:
+        // two addresses, frame about frame) and in 3P / 4P draws half the views a frame: neither the address nor the
+        // order in the frame says which view it is; the camera does (it moves a little between two draws of a view,
+        // and different players' cameras are apart).
+        const float *c = (const float *)(uintptr_t)addr;
+        float best = 40.0f;  // (further than this - a cut, or another view: not the same view)
+        for (int i = 0; i < FSR_VIEWS; i++) {
+            const FsrView *o = &fsr.v[i];
+            if (o->seen || !o->cam_addr || fsr.frame - o->last_frame > 8) continue;
+            float dx = c[47] - o->cam[47], dy = c[51] - o->cam[51], dz = c[55] - o->cam[55];
+            float fx = c[8] - o->cam[8], fy = c[9] - o->cam[9], fz = c[10] - o->cam[10];
+            float d = sqrtf(dx * dx + dy * dy + dz * dz) + 20.0f * sqrtf(fx * fx + fy * fy + fz * fz);
+            if (d < best) best = d, vi = i;
+        }
+    }
+    if (vi < 0) {  // a new view (its history starts over): the slot of a view gone (not drawn for 2 frames: a camera
+                   // cut in 1P, the old one's slot), else a free one, else the one drawn longest ago. (A free one first
+                   // filled every slot in 1P after a few cuts - each a context of its own.)
+        for (int i = 0; i < FSR_VIEWS; i++) {
+            const FsrView *o = &fsr.v[i];
+            if (o->seen || !o->cam_addr || fsr.frame - o->last_frame <= 2) continue;
+            if (vi < 0 || o->last_frame < fsr.v[vi].last_frame) vi = i;
+        }
+        for (int i = 0; i < FSR_VIEWS && vi < 0; i++) if (!fsr.v[i].seen && !fsr.v[i].cam_addr) vi = i;
+        if (vi < 0)
+            for (int i = 0; i < FSR_VIEWS; i++)
+                if (!fsr.v[i].seen && (vi < 0 || fsr.v[i].last_frame < fsr.v[vi].last_frame)) vi = i;
+        if (vi < 0) return -1;
+        FsrView *v = &fsr.v[vi];
+        memset(v, 0, sizeof *v);
+        cap.nvprev[vi] = 0;
+    }
+    fsr.v[vi].cam_addr = addr;
+    FsrView *v = &fsr.v[vi];
+    if (!v->seen) {  // (its first draw this frame: its camera, jitter and time)
+        v->seen = true;
+        fsr.nviews++;
+        memcpy(v->cam, (const void *)(uintptr_t)addr, sizeof v->cam);
+        if (v->last_frame && fsr.frame - v->last_frame > 2) v->have_prev = false;  // (not drawn for a while)
+        v->last_frame = fsr.frame;
+        v->pjx = v->jx, v->pjy = v->jy;
+        fsr3_jitter(++v->nrend, &v->jx, &v->jy);
+        static float jscale = -1;  // (test) LARECOMP_FSR_JSCALE=<k>: the jitter times k (0: none; large: to see it)
+        if (jscale < 0) jscale = getenv("LARECOMP_FSR_JSCALE") ? (float)atof(getenv("LARECOMP_FSR_JSCALE")) : 1.0f;
+        v->jx *= jscale, v->jy *= jscale;
+        uint64_t now = SDL_GetTicksNS();
+        v->dt_ms = v->last_ns && now > v->last_ns ? (float)((now - v->last_ns) / 1e6) : 16.7f;
+        v->last_ns = now;
+    }
+    return vi;
+}
+
+// Each draw, before its pass begins: the frame's state, whether this draw is jittered (the 3D scene's: with its view's
+// jitter, in that view's pixels), and each view's FSR 3 before the first draw outside the scene that samples its colour.
+static void fsr_draw(Prog *pr) {
+    fsr_frame_roll();
+    fsr_jitter_now = false;
+    if (!fsr.active) return;
+    bool scene = fsr_scene_pass();
+    Range cam = st.ubuf[0][0];
+    if (scene && cam.addr && cam.size == FSR_CAM_SIZE) {
+        int vi = fsr_view_of(cam.addr);
+        if (vi < 0) return;
+        FsrView *v = &fsr.v[vi];
+        TexBackend *db = st.rt.depth->backend;
+        uint32_t dw = (uint32_t)content_extent((int)db->width, db->scalable, db->sx, db->ax);
+        uint32_t dh = (uint32_t)content_extent((int)db->height, db->scalable, db->sy, db->ay);
+        if (dw > v->w) v->w = dw, v->h = dh;  // (the view's scene comes first: its size - Dynamic: its drawn part)
+        fsr_jx_ndc = 2.0f * v->jx / (float)v->w;
+        fsr_jy_ndc = -2.0f * v->jy / (float)v->h;
+        fsr_jitter_now = true;
+        fsr_cur_view = vi;
+        if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {  // the view's colour: its largest HDR target
+            TexBackend *cbk = st.rt.color[0]->backend;
+            if (cbk->width == db->width && cbk->height == db->height && (!v->color || cbk->width > v->color->width))
+                v->color = cbk, v->depth = db;
+        }
+        return;
+    }
+    if (scene) return;
+    for (int vi = 0; vi < FSR_VIEWS; vi++) {
+        FsrView *v = &fsr.v[vi];
+        if (!v->seen || v->done || !v->color) continue;
+        for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            if (t && t->backend == v->color) { fsr_run(vi); return; }
+        }
+    }
+}
+
 // Depth copy that upsamples (copy_texture): a fullscreen draw writing bilinear depth (depthup.frag) into the destination
 // rectangle; stencil is kept. Nearest copies (blit / via colour) made stairs of sloped ground when the guest-sized AO
 // depth (textures.c tex_guest_sized_ao) comes from a scaled pyramid of lower resolution: dark horizontal lines in the
@@ -7322,7 +8077,12 @@ static bool depth_upsample_draw(VkCommandBuffer cb, TexBackend *s, TexBackend *d
 // size in the window (its crop is drawn into the viewport).
 static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, float fy, double ow_d, double oh_d, bool *upscaled) {
     VkImageView v = raw_view(b);
-    bool smaa = g_settings.antialias == AA_SMAA;
+    extern bool fsr_fallback_smaa(void);
+    bool smaa = g_settings.antialias == AA_SMAA || fsr_fallback_smaa();
+    {   // (the fallback, once in the log)
+        static bool said;
+        if (!said && g_settings.antialias == AA_FSR3 && smaa) said = true, LOG("[fsr3] FSR 3 can't run here: SMAA in its place\n");
+    }
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;

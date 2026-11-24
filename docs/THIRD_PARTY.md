@@ -25,6 +25,7 @@ are bundled and keep their own licenses. Source code for the exact versions ship
 | Dear ImGui (built in) | 1.91.9 | MIT | https://github.com/ocornut/imgui |
 | SMAA (shader and lookup textures, built in) | 2013 | MIT | https://github.com/iryoku/smaa |
 | AMD FidelityFX FSR 1 (built in) | 1.0 | MIT | https://github.com/GPUOpen-Effects/FidelityFX-FSR |
+| AMD FidelityFX FSR 3 (`amd_fidelityfx_loader_vk.dll`, `amd_fidelityfx_upscaler_vk.dll`: AMD's signed builds, unmodified) | FSR SDK 2.4.0 (upscaler 3.1.6) | AMD binary redistribution license (`AMD-FidelityFX-LICENSE.txt`); the API headers used to build: MIT | https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/tag/v2.4.0 |
 | Ryujinx-derived code (built in, `third_party/ryujinx`) | - | MIT | https://github.com/Ryujinx/Ryujinx |
 | Baloo 2 font (SemiBold) | 1.640 | SIL OFL 1.1 (`Baloo2-OFL.txt`) | https://github.com/EkType/Baloo2 |
 | BIZ UDPGothic font (Regular) | 1.05 | SIL OFL 1.1 (`BIZUDPGothic-OFL.txt`) | https://github.com/googlefonts/morisawa-biz-ud-gothic |
