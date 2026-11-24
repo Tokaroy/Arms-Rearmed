@@ -13,6 +13,11 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
+// 3D detail: the game lowers the resolution of its 3D scene when its GPU timing says the frame is slow (to 1310x737 of
+// a fight's 1600x900, 560x315 per view in 4-player split screen); FULL keeps it at the highest (the timing it reads
+// says the GPU is quick - runtime/nvn/vulkan/exec.c CMD_REPORT_COUNTER). AUTO: full, except on an integrated GPU.
+enum { DETAIL_AUTO = 0, DETAIL_FULL = 1, DETAIL_GAME = 2 };
+bool settings_full_detail(void);
 enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3 };
 // Which face button confirms in our own menus (runtime/ui/pad_nav.mm); the game's input is never affected
 enum { MENU_CONFIRM_GAME = 0, MENU_CONFIRM_CONTROLLER = 1 };
@@ -35,6 +40,7 @@ typedef struct {
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     bool upscaler_auto;  // never chosen: the default for this GPU (settings_resolve_defaults); saved as "auto"
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
+    int detail;          // DETAIL_*: the game's 3D at its full resolution, or lowered by the game's own dynamic resolution
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect
     bool movie_audio;

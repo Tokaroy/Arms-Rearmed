@@ -48,7 +48,12 @@ static _Atomic uint64_t slot_buttons[INPUT_MAX_PLAYERS];
 static _Atomic int32_t slot_lx[INPUT_MAX_PLAYERS], slot_ly[INPUT_MAX_PLAYERS], slot_rx[INPUT_MAX_PLAYERS], slot_ry[INPUT_MAX_PLAYERS];
 static _Atomic uint32_t test_slot_host[INPUT_MAX_PLAYERS];  // the pretend controllers' buttons (host bits)
 static _Atomic SDL_JoystickID pad_id;  // `pad`'s id, for the game thread
-static _Atomic int players_apply_req, player_next_req, identify_req;  // UI thread work (players_poll)
+static _Atomic int players_apply_req, identify_req;  // UI thread work (players_poll)
+static _Atomic int player_step_req[INPUT_MAX_PLAYERS];  // the Players rows' steps not applied yet (◀ -1, ▶ / A +1), summed
+// The order the Players rows were arranged in (players_lock): it decides who gets which controller when the game sets
+// up 2 to 4 players. Without it player 1 is whoever played last (any controller's press switches in single player).
+static SDL_JoystickID pref_order[INPUT_MAX_PLAYERS];
+static bool pref_set;
 static bool is_test_pad(SDL_JoystickID id) { return id >= TEST_PAD_BASE && id < TEST_PAD_BASE + 16; }
 // a player 2-4 slot that has this controller (0: none)
 static int slot_of(SDL_JoystickID id) {
@@ -505,12 +510,103 @@ static void open_pad(SDL_JoystickID id) {
     if (!pad && g_players == 1) use_pad(id, "");  // (more players: a new controller waits to be picked - Controls tab)
 }
 
-// ---- players 2 to 4 (runtime/players.h)
-static const char *pad_name(SDL_JoystickID id, char *buf, size_t cap) {
+// ---- controller names (the Controls tab's Controller names): the player's own name for a controller, kept in
+// controllers.ini in the data folder, a line "<controller> = <name>" each. <controller>: its type (SDL's GUID) and its
+// serial number when it reports one (Switch Pro, DualSense over USB / Bluetooth), else where it is connected - two
+// identical controllers without serial numbers keep their names by port.
+#define NAMES_FILE "controllers.ini"
+#define NAME_MAX_LEN 40
+static pthread_mutex_t names_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { char key[192]; char name[NAME_MAX_LEN + 1]; } g_names[64];
+static int g_nnames = -1;
+static void pad_key(SDL_JoystickID id, char *out, size_t cap) {
+    if (is_test_pad(id)) { snprintf(out, cap, "test-%u", (unsigned)(id - TEST_PAD_BASE)); return; }
+    char guid[40];
+    SDL_GUIDToString(SDL_GetGamepadGUIDForID(id), guid, sizeof guid);
+    SDL_Gamepad *g = SDL_GetGamepadFromID(id);
+    const char *serial = g ? SDL_GetGamepadSerial(g) : NULL, *path = SDL_GetGamepadPathForID(id);
+    snprintf(out, cap, "%s-%s", guid, serial && *serial ? serial : path ? path : "");
+    for (char *c = out; *c; c++)
+        if (*c == '=' || *c == ' ' || *c == '\t' || *c == '\r' || *c == '\n') *c = '_';  // (one key, one line)
+}
+static void names_load(void) {  // (names_lock held)
+    if (g_nnames >= 0) return;
+    g_nnames = 0;
+    FILE *f = fopen(NAMES_FILE, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f) && g_nnames < 64) {
+        char *eq = strchr(line, '=');
+        if (!eq || line[0] == '#') continue;
+        *eq = 0;
+        char *k = line, *v = eq + 1;
+        while (*k == ' ') k++;
+        for (char *e = k + strlen(k); e > k && e[-1] == ' '; ) *--e = 0;
+        while (*v == ' ') v++;
+        for (char *e = v + strlen(v); e > v && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' '); ) *--e = 0;
+        if (!*k || !*v) continue;
+        snprintf(g_names[g_nnames].key, sizeof g_names[0].key, "%s", k);
+        snprintf(g_names[g_nnames].name, sizeof g_names[0].name, "%s", v);
+        g_nnames++;
+    }
+    fclose(f);
+}
+static void names_save(void) {  // (names_lock held)
+    FILE *f = fopen(NAMES_FILE ".tmp", "w");
+    if (!f) { LOG("[input] couldn't write %s\n", NAMES_FILE); return; }
+    fprintf(f, "# ARMS Rearmed: your names for your controllers (the in-game menu: Controls, Controller names)\n");
+    for (int i = 0; i < g_nnames; i++) fprintf(f, "%s = %s\n", g_names[i].key, g_names[i].name);
+    fclose(f);
+    remove(NAMES_FILE);
+    rename(NAMES_FILE ".tmp", NAMES_FILE);
+}
+// the player's name for controller id ("" when none)
+static void custom_name(SDL_JoystickID id, char *out, size_t cap) {
+    char key[192];
+    pad_key(id, key, sizeof key);
+    out[0] = 0;
+    pthread_mutex_lock(&names_lock);
+    names_load();
+    for (int i = 0; i < g_nnames; i++)
+        if (!strcmp(g_names[i].key, key)) { snprintf(out, cap, "%s", g_names[i].name); break; }
+    pthread_mutex_unlock(&names_lock);
+}
+static void set_custom_name(SDL_JoystickID id, const char *name) {
+    char key[192], clean[NAME_MAX_LEN + 1];
+    pad_key(id, key, sizeof key);
+    size_t n = 0;
+    while (*name == ' ') name++;
+    for (const char *s = name; *s && n < NAME_MAX_LEN; s++) clean[n++] = *s == '\r' || *s == '\n' ? ' ' : *s;
+    while (n && clean[n - 1] == ' ') n--;
+    clean[n] = 0;
+    pthread_mutex_lock(&names_lock);
+    names_load();
+    int at = -1;
+    for (int i = 0; i < g_nnames; i++) if (!strcmp(g_names[i].key, key)) at = i;
+    if (!clean[0]) {  // (no name: the controller's own again)
+        if (at >= 0) g_names[at] = g_names[--g_nnames];
+    } else {
+        if (at < 0 && g_nnames < 64) at = g_nnames++;
+        if (at >= 0) {
+            snprintf(g_names[at].key, sizeof g_names[0].key, "%s", key);
+            snprintf(g_names[at].name, sizeof g_names[0].name, "%s", clean);
+        }
+    }
+    names_save();
+    pthread_mutex_unlock(&names_lock);
+    LOG("[input] controller %s named \"%s\"\n", key, clean);
+}
+static const char *type_name(SDL_JoystickID id, char *buf, size_t cap) {  // what the controller says it is
     if (is_test_pad(id)) { snprintf(buf, cap, "Test controller %u", (unsigned)(id - TEST_PAD_BASE) + 1); return buf; }
     const char *n = id ? SDL_GetGamepadNameForID(id) : NULL;
     snprintf(buf, cap, "%s", n && *n ? n : "Controller");
     return buf;
+}
+
+// ---- players 2 to 4 (runtime/players.h)
+static const char *pad_name(SDL_JoystickID id, char *buf, size_t cap) {  // the player's name for it, else its type
+    custom_name(id, buf, cap);
+    return buf[0] ? buf : type_name(id, buf, cap);
 }
 static int connected_pads(SDL_JoystickID *out, int cap) {  // (players_lock held)
     int n = 0;
@@ -531,21 +627,67 @@ int input_controllers(void) {
     return n;
 }
 int input_players(void) { return g_players; }
+// The controllers in the order players get them when the game sets up 2 to 4 (players_lock held): the Players rows'
+// arrangement (pref_order) first, then player 1's controller, then the others as connected
+static int plan_order(SDL_JoystickID *out, int cap) {
+    SDL_JoystickID all[32];
+    int na = connected_pads(all, 32), n = 0;
+    if (pref_set)
+        for (int k = 0; k < INPUT_MAX_PLAYERS && n < cap; k++)
+            if (pref_order[k] && in_list(all, na, pref_order[k]) && !in_list(out, n, pref_order[k])) out[n++] = pref_order[k];
+    if (pad_id && in_list(all, na, pad_id) && !in_list(out, n, pad_id) && n < cap) out[n++] = pad_id;
+    for (int i = 0; i < na && n < cap; i++) if (!in_list(out, n, all[i])) out[n++] = all[i];
+    return n;
+}
+int input_player_rows(void) {  // players set up, else one row per controller (up to 4): who will get which
+    if (g_players > 1) return g_players;
+    int n = input_controllers();
+    return n < 1 ? 1 : n > INPUT_MAX_PLAYERS ? INPUT_MAX_PLAYERS : n;
+}
 void input_player_device(int p, char *out, size_t cap) {
     char nm[128];
     out[0] = 0;
     if (p < 0 || p >= INPUT_MAX_PLAYERS) return;
+    SDL_JoystickID id = 0;
+    if (g_players > 1) {
+        if (p >= g_players) return;
+        id = slot_pad[p];
+    } else {
+        SDL_JoystickID plan[32];
+        pthread_mutex_lock(&players_lock);
+        int n = plan_order(plan, 32);
+        pthread_mutex_unlock(&players_lock);
+        id = p < n ? plan[p] : 0;
+    }
     if (p == 0) {
-        SDL_JoystickID id = g_players > 1 ? slot_pad[0] : pad_id;
         if (id) snprintf(out, cap, "Keyboard + %s", pad_name(id, nm, sizeof nm));
         else snprintf(out, cap, "Keyboard");
-    } else if (p < g_players) {
-        snprintf(out, cap, "%s", slot_pad[p] ? pad_name(slot_pad[p], nm, sizeof nm) : "No controller");
+    } else {
+        snprintf(out, cap, "%s", id ? pad_name(id, nm, sizeof nm) : "No controller");
     }
 }
-static void players_notice(void) {
+// Controller names: the controllers connected, in connection order
+int input_controller_count(void) { return input_controllers(); }
+bool input_controller_info(int i, char *type, size_t tcap, char *custom, size_t ccap) {
+    SDL_JoystickID ids[32];
+    pthread_mutex_lock(&players_lock);
+    int n = connected_pads(ids, 32);
+    pthread_mutex_unlock(&players_lock);
+    if (i < 0 || i >= n) return false;
+    type_name(ids[i], type, tcap);
+    custom_name(ids[i], custom, ccap);
+    return true;
+}
+void input_controller_rename(int i, const char *name) {
+    SDL_JoystickID ids[32];
+    pthread_mutex_lock(&players_lock);
+    int n = connected_pads(ids, 32);
+    pthread_mutex_unlock(&players_lock);
+    if (i >= 0 && i < n) set_custom_name(ids[i], name);
+}
+static void players_notice(void) {  // (one player: the order planned for when 2 to 4 play)
     char msg[256] = "", dev[128];
-    int n = g_players;
+    int n = input_player_rows();
     for (int p = 0; p < n; p++) {
         input_player_device(p, dev, sizeof dev);
         size_t l = strlen(msg);
@@ -562,12 +704,14 @@ bool input_setup_players(int min, int max, int *count) {
     SDL_JoystickID all[32], order[32];
     pthread_mutex_lock(&players_lock);
     int na = connected_pads(all, 32), n = 0;
-    // the arrangement so far (the Players rows) first, then player 1's controller, then the rest as connected
+    // the players as they are (several set up already), then the Players rows' order (plan_order: as arranged there,
+    // else player 1's controller first, then the rest as connected)
     if (g_players > 1)
         for (int k = 0; k < g_players; k++)
             if (slot_pad[k] && in_list(all, na, slot_pad[k]) && !in_list(order, n, slot_pad[k])) order[n++] = slot_pad[k];
-    if (pad_id && in_list(all, na, pad_id) && !in_list(order, n, pad_id)) order[n++] = pad_id;
-    for (int i = 0; i < na; i++) if (!in_list(order, n, all[i])) order[n++] = all[i];
+    SDL_JoystickID plan[32];
+    int np = plan_order(plan, 32);
+    for (int i = 0; i < np; i++) if (!in_list(order, n, plan[i])) order[n++] = plan[i];
     SDL_JoystickID slots[INPUT_MAX_PLAYERS] = {0};
     int players;
     if (n >= min) {  // a controller each (player 1 keeps the keyboard too)
@@ -598,43 +742,71 @@ bool input_setup_players(int min, int max, int *count) {
     return true;
 }
 
-void input_player_next(int p) { if (p >= 0 && p < INPUT_MAX_PLAYERS) player_next_req = p + 1; }
+void input_player_step(int p, int dir) {
+    if (p >= 0 && p < INPUT_MAX_PLAYERS && dir) atomic_fetch_add(&player_step_req[p], dir > 0 ? 1 : -1);
+}
 void input_players_identify(void) { identify_req = 1; }
 
-// UI thread (input_rumble_poll): the requests above
-static void players_poll(void) {
-    int p = atomic_exchange(&player_next_req, 0) - 1;
-    if (p >= 0) {  // player p's next controller: the keyboard alone (player 1 with more players), then each one connected
-        SDL_JoystickID all[32], cand[33];
-        pthread_mutex_lock(&players_lock);
-        int na = connected_pads(all, 32), nc = 0;
-        int n = g_players;
-        if (p == 0 && n > 1) cand[nc++] = 0;
-        for (int i = 0; i < na; i++) cand[nc++] = all[i];
-        SDL_JoystickID cur = n > 1 ? slot_pad[p] : pad_id;
+// One step of player p's controller (dir +1 / -1 through the controllers connected; player 1 also the keyboard alone
+// while several play): it swaps with the player who had it. Several players: their controllers now. One: the order
+// they'll get when the game sets up 2 to 4 (pref_order), and player 1's controller plays now. (players_lock held;
+// returns the controller player 1 should play with now, 0: no change)
+static SDL_JoystickID player_step(int p, int dir) {
+    SDL_JoystickID all[32], cand[33];
+    int na = connected_pads(all, 32), nc = 0, n = g_players;
+    if (p == 0 && n > 1) cand[nc++] = 0;
+    for (int i = 0; i < na; i++) cand[nc++] = all[i];
+    if (!nc) return 0;
+    if (n > 1) {
+        if (p >= n) return 0;
+        SDL_JoystickID cur = slot_pad[p];
         int at = -1;
         for (int i = 0; i < nc; i++) if (cand[i] == cur) at = i;
-        for (int step = 1; step <= nc && nc; step++) {
-            SDL_JoystickID next = cand[(at + step + nc) % nc];
+        for (int s = 1; s <= nc; s++) {
+            SDL_JoystickID next = cand[((at + dir * s) % nc + nc) % nc];
             if (next == cur) break;
-            if (n == 1) {  // single player: which controller plays
-                pthread_mutex_unlock(&players_lock);
-                if (!is_test_pad(next)) use_pad(next, " (picked in the menu)");
-                pthread_mutex_lock(&players_lock);
-                break;
-            }
             int other = -1;
             for (int k = 0; k < n; k++) if (k != p && next && slot_pad[k] == next) other = k;
             if (other > 0 && !cur) continue;  // (a player after the first can't be left with the keyboard alone)
             if (other >= 0) slot_pad[other] = cur;
             slot_pad[p] = next;
             for (int k = 1; k < n; k++) recompute_slot(k);
+            for (int k = 0; k < INPUT_MAX_PLAYERS; k++) pref_order[k] = k < n ? slot_pad[k] : 0;
+            pref_set = true;
             players_apply_req = 1;
             break;
         }
-        pthread_mutex_unlock(&players_lock);
-        if (g_players > 1) players_notice();
+        return 0;
     }
+    SDL_JoystickID plan[32];
+    int np = plan_order(plan, 32);
+    if (p >= np) return 0;
+    SDL_JoystickID cur = plan[p];
+    int at = 0;
+    for (int i = 0; i < nc; i++) if (cand[i] == cur) at = i;
+    SDL_JoystickID next = cand[((at + dir) % nc + nc) % nc];
+    if (next == cur) return 0;
+    for (int i = 0; i < np; i++) if (plan[i] == next) plan[i] = cur;
+    plan[p] = next;
+    for (int k = 0; k < INPUT_MAX_PLAYERS; k++) pref_order[k] = k < np ? plan[k] : 0;
+    pref_set = true;
+    return plan[0] != pad_id ? plan[0] : 0;
+}
+
+// UI thread (input_rumble_poll): the requests above
+static void players_poll(void) {
+    bool stepped = false;
+    for (int p = 0; p < INPUT_MAX_PLAYERS; p++) {
+        int s = atomic_exchange(&player_step_req[p], 0);  // (every press counts: a summed count, not a flag)
+        for (; s; s += s > 0 ? -1 : 1) {
+            pthread_mutex_lock(&players_lock);
+            SDL_JoystickID p1 = player_step(p, s > 0 ? 1 : -1);
+            pthread_mutex_unlock(&players_lock);
+            if (p1 && !is_test_pad(p1)) use_pad(p1, " (player 1 in the menu)");
+            stepped = true;
+        }
+    }
+    if (stepped) players_notice();
     if (atomic_exchange(&players_apply_req, 0)) {
         int n = g_players;
         if (n > 1) {
@@ -655,12 +827,17 @@ static void players_poll(void) {
     }
     if (atomic_exchange(&identify_req, 0)) {
         int n = g_players;
-        for (int k = 0; k < n; k++) {
-            SDL_JoystickID id = n > 1 ? slot_pad[k] : pad_id;
+        SDL_JoystickID plan[32];
+        pthread_mutex_lock(&players_lock);
+        int np = n > 1 ? 0 : plan_order(plan, 32);
+        pthread_mutex_unlock(&players_lock);
+        int rows = n > 1 ? n : np < INPUT_MAX_PLAYERS ? np : INPUT_MAX_PLAYERS;
+        for (int k = 0; k < rows; k++) {
+            SDL_JoystickID id = n > 1 ? slot_pad[k] : plan[k];
             SDL_Gamepad *g = id && !is_test_pad(id) ? SDL_GetGamepadFromID(id) : NULL;
             if (g) SDL_RumbleGamepad(g, 0x7000, 0x7000, 300 + 250 * (Uint32)k);  // (longer for each later player)
         }
-        if (n > 1) players_notice();
+        if (rows > 1) players_notice();
         else {
             char dev[128], msg[160];
             input_player_device(0, dev, sizeof dev);

@@ -243,9 +243,28 @@ bool menu_handle_event(const SDL_Event *e) {
         return true;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         bool down = e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
-        if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) back_down = down;
-        if (e->gbutton.button == SDL_GAMEPAD_BUTTON_START) start_down = down;
-        if (down && !typing && ((back_down && start_down) || e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
+        Uint8 btn = e->gbutton.button;
+        if (btn == SDL_GAMEPAD_BUTTON_BACK) back_down = down;
+        if (btn == SDL_GAMEPAD_BUTTON_START) start_down = down;
+        // Back + Start (Select + Start, - and +, View + Menu, Create + Options): the events say both are down, or the
+        // controller itself does - a press the events missed (made while the window was in the background, or before
+        // the controller was opened) left the flags wrong and the pair did nothing (a player's report)
+        bool pair = back_down && start_down;
+        if (down && !pair && (btn == SDL_GAMEPAD_BUTTON_BACK || btn == SDL_GAMEPAD_BUTTON_START))
+            if (SDL_Gamepad *g = SDL_GetGamepadFromID(e->gbutton.which))
+                pair = SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_BACK) && SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_START);
+        if (down && (btn == SDL_GAMEPAD_BUTTON_BACK || btn == SDL_GAMEPAD_BUTTON_START || btn == SDL_GAMEPAD_BUTTON_GUIDE)) {
+            static int nlog;  // (the log says what a controller sends: a report of the pair not working)
+            if (nlog++ < 30) {
+                const char *nm = SDL_GetGamepadNameForID(e->gbutton.which);
+                LOG("[menu] %s: %s down (back %d start %d%s)\n", nm ? nm : "controller",
+                    btn == SDL_GAMEPAD_BUTTON_BACK ? "Back" : btn == SDL_GAMEPAD_BUTTON_START ? "Start" : "Home",
+                    back_down, start_down, typing ? ", typing" : "");
+            }
+        }
+        if (down && !typing && (pair || btn == SDL_GAMEPAD_BUTTON_GUIDE)) {
+            LOG("[menu] %s from a controller (%s)\n", g_open.load() ? "closed" : "opened", pair ? "Back + Start" : "Home");
+            back_down = start_down = false;  // (a fresh pair for the next time: no stale half)
             set_open(!g_open.load());
             return true;
         }
@@ -512,6 +531,15 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+    {   // 3D detail (settings.h DETAIL_*): the game's own dynamic resolution, or its 3D always at the highest
+        char autoname[48];
+        snprintf(autoname, sizeof autoname, "Automatic (%s)", g_gpu_integrated ? "the game's" : "Full");
+        const char *dn[] = {autoname, "Full", "The game's"};
+        opt_choice("3D detail", &g_settings.detail, dn, 3, DETAIL_AUTO,
+                   "Full: the fights' 3D at the game's highest resolution all the time, much sharper in 4-player split "
+                   "screen. The game's: it lowers that resolution whenever it thinks the GPU is busy, as on the "
+                   "Switch (and can drop to 30 fps). Automatic: Full, except on integrated graphics.");
+    }
     // (Link's Awakening's "Remove blur" and "Hide Hero Mode icon" were a "Game" section here: nothing in ARMS)
     opt_end();
 }

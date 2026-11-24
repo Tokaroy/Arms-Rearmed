@@ -252,6 +252,11 @@ bool opt_action(const char *label, const char *value, const char *desc, bool upp
     return row(label, value ? value : "", changed, desc, upper) == 2;
 }
 
+int opt_step(const char *label, const char *value, const char *desc, bool changed) {
+    int s = row(label, value && *value ? value : "-", changed, desc, true, true);
+    return s == 2 ? 1 : s;
+}
+
 bool opt_colour(const char *label, CosColour *c, int slot, const char *desc) {
     int prev = c->pick;
     const char *names[N_COL];

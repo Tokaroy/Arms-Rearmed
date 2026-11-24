@@ -91,7 +91,8 @@
         "show_fps": "0",
         "volume": "1.00",
         "rumble": "1",
-        "background_input": "0"
+        "background_input": "0",
+        "detail": "auto"
       }
     }
   ],
@@ -261,6 +262,35 @@
       ],
       "defaults": {
         "antialias": "off"
+      }
+    },
+    {
+      "id": "detail",
+      "label": "3D detail",
+      "group": "Quality",
+      "help": "Full keeps the fights' 3D at the game's highest resolution (much sharper in 4-player split screen). The game's own lowers it when it thinks the GPU is busy. Automatic: Full, except on integrated graphics.",
+      "choices": [
+        {
+          "label": "Automatic",
+          "set": {
+            "detail": "auto"
+          }
+        },
+        {
+          "label": "Full",
+          "set": {
+            "detail": "full"
+          }
+        },
+        {
+          "label": "The game's own",
+          "set": {
+            "detail": "game"
+          }
+        }
+      ],
+      "defaults": {
+        "detail": "auto"
       }
     },
     {

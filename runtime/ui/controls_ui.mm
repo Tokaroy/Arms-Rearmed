@@ -266,24 +266,45 @@ extern "C" void controls_tab_draw(float scale) {
 
     // Players: who plays with what. The game sets up 2 to 4 players when they're chosen (each gets a controller of
     // their own: runtime/hle/input.c); here they can be put in another order, and each controller found.
+    // Before players are set up there is a row per controller connected (up to 4): the order they'll be given in, kept
+    // once arranged here (otherwise player 1 is whoever pressed something last).
     opt_section("Players");
     {
-        int n = input_players();
+        int n = input_players(), rows = input_player_rows();
         char dev[128], label[24];
-        for (int p = 0; p < (n > 1 ? n : 1); p++) {
+        for (int p = 0; p < rows; p++) {
             snprintf(label, sizeof label, "Player %d", p + 1);
             input_player_device(p, dev, sizeof dev);
-            if (opt_action(label, dev,
-                           n > 1 ? "Give this player the next controller: it swaps with the player who has it. Player 1 "
-                                   "also plays with the keyboard, or with the keyboard alone."
-                                 : "Play with the next connected controller. Choose 2 to 4 players in the game and each "
-                                   "player gets a controller of their own, in the order they were connected.",
-                           true, false))
-                input_player_next(p);
+            int s = opt_step(label, dev,
+                             n > 1 ? "Left / right: give this player another controller (it swaps with the player who "
+                                     "has it). Player 1 also plays with the keyboard, or with the keyboard alone."
+                             : rows > 1 ? "Who gets which controller when you choose 2, 3 or 4 players in the game. Left / "
+                                          "right: give this player another controller (it swaps with the player who has "
+                                          "it). The order stays as you set it. Player 1 also plays with the keyboard."
+                                        : "The controller player 1 plays with (any controller you press takes over in "
+                                          "single player). Connect more controllers to arrange 2 to 4 players here.");
+            if (s) input_player_step(p, s);
         }
         if (opt_button("Identify controllers", "Each player's controller vibrates (longer for each later player) and "
                                                "the bottom of the screen shows who is who."))
             input_players_identify();
+    }
+
+    // Controller names: the player's own name for each controller, shown in the Players rows and the notices
+    if (int nc = input_controller_count()) {
+        opt_section("Controller names");
+        static char bufs[16][48];
+        for (int i = 0; i < nc && i < 16; i++) {
+            char type[96], custom[48], label[128];
+            if (!input_controller_info(i, type, sizeof type, custom, sizeof custom)) continue;
+            snprintf(label, sizeof label, "%d. %s", i + 1, type);
+            if (!opt_text_editing(label)) snprintf(bufs[i], sizeof bufs[i], "%s", custom);  // (not being typed in: as kept)
+            if (opt_text(label, bufs[i], sizeof bufs[i], "No name",
+                         "Your name for this controller (\"Sam\", \"Blue Pro Controller\"...): the Players rows and the "
+                         "notices show it, so everyone knows which one is theirs. Empty: the controller's own name. "
+                         "Kept for this controller from now on."))
+                input_controller_rename(i, bufs[i]);
+        }
     }
 
     opt_section("Controller");

@@ -126,10 +126,14 @@ void settings_resolve_defaults(bool integrated) {
     g_default_res_mode = 1;
     if (g_settings.upscaler_auto) g_settings.upscaler = g_default_upscaler;
     if (g_settings.res_auto) g_settings.res_mode = g_default_res_mode;
-    LOG("[settings] %s GPU: upscaler %s (%s), resolution %s (%s), anti-aliasing %s\n", integrated ? "integrated" : "discrete / other",
+    LOG("[settings] %s GPU: upscaler %s (%s), resolution %s (%s), anti-aliasing %s, 3D detail %s\n", integrated ? "integrated" : "discrete / other",
         g_settings.upscaler == UPSCALE_BILINEAR ? "bilinear" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "metalfx",
         g_settings.upscaler_auto ? "default" : "chosen", res_name(g_settings.res_mode), g_settings.res_auto ? "default" : "chosen",
-        g_settings.antialias == AA_SMAA ? "smaa" : "off");
+        g_settings.antialias == AA_SMAA ? "smaa" : "off", settings_full_detail() ? "full" : "the game's own");
+}
+
+bool settings_full_detail(void) {
+    return g_settings.detail == DETAIL_FULL || (g_settings.detail == DETAIL_AUTO && !g_gpu_integrated);
 }
 
 void settings_load(void) {
@@ -176,6 +180,7 @@ void settings_load(void) {
             else g_settings.upscaler = g_default_upscaler;
         }
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
+        else if (!strcmp(key, "detail")) g_settings.detail = !strcmp(val, "full") ? DETAIL_FULL : !strcmp(val, "game") ? DETAIL_GAME : DETAIL_AUTO;
         else if (!strcmp(key, "inv_keys")) g_settings.inv_keys = atoi(val) != 0;
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
         else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) != 0;
@@ -260,6 +265,7 @@ void settings_save(void) {
     fprintf(f, "upscaler = %s\n", g_settings.upscaler_auto ? "auto" : g_settings.upscaler == UPSCALE_METALFX ? "metalfx" :
                                    g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
+    fprintf(f, "detail = %s\n", g_settings.detail == DETAIL_FULL ? "full" : g_settings.detail == DETAIL_GAME ? "game" : "auto");
     fprintf(f, "resolution = %s\n", g_settings.res_auto ? "auto" : res_name(g_settings.res_mode));
     fprintf(f, "inv_keys = %d\n", g_settings.inv_keys);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);

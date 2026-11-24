@@ -226,6 +226,7 @@ static uint64_t observable_limit(uint64_t seq) {
 #define CQ_MAX 64
 typedef struct { VkQueryPool pool; uint32_t n; uint64_t seq; uint64_t *out[CQ_MAX]; } CounterQ;
 static CounterQ cq[SUBS];
+static int cq_mode[SUBS];  // the counter mode each slot's command buffer began with (its queries reset only in mode 2)
 static pthread_mutex_t cq_lock = PTHREAD_MUTEX_INITIALIZER;
 static int64_t cq_offset;  // host ns - GPU ns (the smallest seen)
 // Counter timestamps are in the Switch GPU's ticks (614.4 MHz): the game converts the difference to ns itself
@@ -235,11 +236,19 @@ static bool cq_calibrated;
 static int counter_mode = -1;  // 0 cpu, 1 frozen, 2 gpu
 static uint64_t stat_counters_gpu;
 
+// 3D detail (settings_full_detail, Video tab): full - every counter of a frame the same time, the GPU time the game
+// sees is none, so its dynamic resolution keeps its 3D scene at the highest (a fight's 1600x900 instead of 1310x737;
+// 560x315 per view in 4-player split screen before) and it never turns to its 30 fps mode; else its own (2: the GPU's
+// times). LARECOMP_VK_COUNTER (test) overrides the setting.
 static int vk_counter_mode(void) {
     if (counter_mode < 0) {
         const char *e = getenv("LARECOMP_VK_COUNTER");
-        counter_mode = e && !strcmp(e, "cpu") ? 0 : e && !strcmp(e, "frozen") ? 1 : e && !strcmp(e, "legacy") ? 3 : 2;
+        counter_mode = e && !strcmp(e, "cpu") ? 0 : e && !strcmp(e, "frozen") ? 1 : e && !strcmp(e, "legacy") ? 3 : e ? 2 : 4;
         if (counter_mode == 2 && !g_vk.props.limits.timestampComputeAndGraphics) counter_mode = 0;
+    }
+    if (counter_mode == 4) {  // (the setting: it can change in game)
+        extern bool settings_full_detail(void);
+        return settings_full_detail() ? 1 : g_vk.props.limits.timestampComputeAndGraphics ? 2 : 0;
     }
     return counter_mode;
 }
@@ -393,7 +402,8 @@ VkCommandBuffer vk_cmd(void) {
     if (!s->main_begun) {
         begin_cb(&s->main, &s->main_begun);
         ss_forget();  // (a new command buffer starts with no state)
-        if (vk_counter_mode() == 2) {  // this slot's timing counter queries (reset outside any render pass)
+        cq_mode[cur_sub] = vk_counter_mode();  // (the 3D detail setting can change: this buffer keeps its mode)
+        if (cq_mode[cur_sub] == 2) {  // this slot's timing counter queries (reset outside any render pass)
             CounterQ *q = &cq[cur_sub];
             if (!q->pool) {
                 VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
@@ -7689,7 +7699,7 @@ static void exec_list(uint64_t handle, int depth) {
                 VkCommandBuffer cb = vk_cmd();  // (first: may begin the buffer, which resets the slot's queries)
                 CounterQ *q = &cq[cur_sub];
                 pthread_mutex_lock(&cq_lock);
-                if (q->pool && q->n < CQ_MAX) {
+                if (q->pool && q->n < CQ_MAX && cq_mode[cur_sub] == 2) {
                     rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, q->pool, q->n);
                     q->out[q->n++] = out;
                 }

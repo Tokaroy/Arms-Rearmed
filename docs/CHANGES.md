@@ -258,6 +258,33 @@ address table of its own.
   the hot game code is the Yaz0 decompression and a resource lookup by name (a linked list, names compared byte by
   byte). `LARECOMP_TRACE_SVC=1` lines now have the thread, the call's duration and the time.
 
+## Players rows, controller names, Back + Start, 3D detail (2026-11-23, the player's next report)
+
+- **Players rows** (`runtime/hle/input.c`, `runtime/ui/controls_ui.mm`): "rearranging players is finicky and doesn't
+  always register". A row's request was one slot (`player_next_req = p + 1`): presses before the UI thread took it
+  were lost; and it only went forward. Now each row is ◀ controller ▶ (`opt_step`, `runtime/ui/option_rows.mm`): its
+  steps are summed per player (`player_step_req`) and every one is applied, either way. With one player there is a
+  row per controller connected (up to 4): the order they'll get when 2 to 4 are chosen. An arrangement made there is
+  kept (`pref_order`, `plan_order`): before, player 1 was whoever pressed something last (any press switches in
+  single player), so a friend's press in the game's menus reordered everyone. Tested with `LARECOMP_TEST_PADS`:
+  3 quick presses all applied; arranged, then Versus 2P set up in that order. Identify covers the planned rows too.
+- **Controller names**: a Controls tab section, a text row per controller (keyboard or on-screen keyboard). Kept in
+  `controllers.ini` in the data folder (`<SDL GUID>-<serial, else its path> = <name>`); shown wherever a controller's
+  name is (Players rows, notices, the log).
+- **Back + Start didn't open the menu for the player** (here it does, with SDL controller events). The pair was two
+  flags set by events only: a press the events missed left them wrong. It now also asks the controller whether both
+  are down, clears the pair once used, and logs the first Back / Start / Home presses (`[menu] ...`) with the
+  controller's name, for the next report.
+- **3D detail** (`settings.detail`: auto / full / game; Video tab, RecompLauncher): the game lowers its 3D scene's
+  resolution by its GPU timing counters - a fight's 1310x737 of its 1600x900, 560x315 per view in 4-player split
+  screen ("lower resolution and anti-aliasing for things far away"). Full: every counter of a frame reads the same time
+  (the counters' frozen mode, `vk_counter_mode` in `exec.c`), so the game sees a quick GPU: 1600x900 fights, 800x450
+  per 4-player view, 60 fps here at 2x. It also never turns to its 30 fps mode, so it is Automatic's choice except on
+  integrated graphics (there: the game's own, as before). Each command buffer keeps the counter mode it began with
+  (`cq_mode`): the setting can change in game.
+- Asked for, not done: DLSS / FSR 3. Both are temporal upscalers that need the game's motion vectors and a jittered
+  camera; ARMS has neither to hand, so it would mean finding and changing the game's camera and adding a velocity pass.
+
 What this project changed relative to [LAS Recomp](https://github.com/peiikai/LASRecomp) (its recompiler and Switch
 runtime), why, and where. It also lists the debugging switches, the test routes, the known gaps and the next steps.
 It started as DOAX3 Recomp (the sections from "Project setup" to "Test routes" are that work, which MUA3 inherits:

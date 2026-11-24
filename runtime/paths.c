@@ -109,8 +109,8 @@ bool rt_dev_mode(void) { return g_dev; }
 #define NOTE_FROM ".lasrecomp_move_from"        // in a move's destination: the old folder, still to be emptied
 #define MARK_PARTIAL ".lasrecomp_incomplete"    // in a move's destination until its copy was checked
 // What a data folder holds (and a move takes along). Logs stay where they are.
-static const char *const DATA_ENTRIES[] = {"save", "rando", "larecomp.ini", "fonts", "gamecontrollerdb.txt", "cache",
-                                           "extracted"};
+static const char *const DATA_ENTRIES[] = {"save", "rando", "larecomp.ini", "controllers.ini", "fonts",
+                                           "gamecontrollerdb.txt", "cache", "extracted"};
 #define N_ENTRIES (sizeof DATA_ENTRIES / sizeof *DATA_ENTRIES)
 static char g_home[1024];  // the platform's folder (where POINTER_FILE lives)
 

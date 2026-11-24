@@ -31,6 +31,9 @@ bool opt_radio(const char *label, bool selected, const char *desc);
 // an action / item row with a value on the right (upper: the label in capitals, as option rows; false: as written,
 // e.g. a seed name); true when activated
 bool opt_action(const char *label, const char *value, const char *desc, bool upper = true, bool changed = false);
+// a choice the caller keeps (◀ value ▶, e.g. a list that changes): -1 / +1 for left / right (or their arrows), +1 for
+// A / click, 0 otherwise
+int opt_step(const char *label, const char *value, const char *desc, bool changed = false);
 // a row that opens more (a submenu, a list on the right): a chevron on the right; true on A / click / Right
 bool opt_link(const char *label, const char *desc);
 // text: the value shown on the right (hint when empty); A / click turns the row into a text field (the on-screen
