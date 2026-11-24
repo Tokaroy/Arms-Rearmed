@@ -210,7 +210,7 @@ static void list_modes(void) {
 }
 
 static int s_mode, s_size, s_render, s_upscaler, s_aa, s_aspect;
-static bool s_show_fps, s_rumble, s_bg_input, s_skip_title;
+static bool s_show_fps, s_rumble, s_bg_input;
 static float s_volume = 1.0f;
 
 static void settings_from_ini(void) {
@@ -225,7 +225,6 @@ static void settings_from_ini(void) {
     s_aa = choice_index(k_aa, IM_ARRAYSIZE(k_aa), I.get("antialias", "off"));
     s_aspect = choice_index(k_aspect, IM_ARRAYSIZE(k_aspect), I.get("aspect", "original"));
     s_show_fps = atoi(I.get("show_fps", "0").c_str()) != 0;
-    s_skip_title = atoi(I.get("skip_title", "0").c_str()) != 0;
     s_rumble = atoi(I.get("rumble", "1").c_str()) != 0;
     s_bg_input = atoi(I.get("background_input", "0").c_str()) != 0;
     s_volume = (float)atof(I.get("volume", "1.0").c_str());
@@ -241,7 +240,6 @@ static bool settings_to_ini(void) {
     I.set("antialias", k_aa[s_aa].value);
     I.set("aspect", k_aspect[s_aspect].value);
     I.set("show_fps", s_show_fps ? "1" : "0");
-    I.set("skip_title", s_skip_title ? "1" : "0");
     I.set("rumble", s_rumble ? "1" : "0");
     I.set("background_input", s_bg_input ? "1" : "0");
     char v[32];
@@ -970,8 +968,6 @@ static void page_play(void) {
     ImGui::Combo("##mode_play", &s_mode, modes, 3);
     row_label("Frame rate counter", lw);
     ImGui::Checkbox("##fps_play", &s_show_fps);
-    row_label("Skip the title screen", lw);
-    ImGui::Checkbox("##skip_title", &s_skip_title);
     ImGui::Spacing();
     hint("Keyboard and mouse: WASD move, left / right mouse punch, middle mouse (or both) grab, Space jump, Shift dash, "
          "Ctrl guard, Q / E rush. Controllers work too (2 to 4 players: a controller each). Esc or F1 in game, or Home or Back + Start on a "

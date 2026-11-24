@@ -12,7 +12,7 @@ PY       := .venv/Scripts/python.exe
 
 # The release's version (its zip's name, the log's [info] line). RELEASE=1: the build `make dist` ships (no console
 # window - the log goes to armsrecomp.log next to the exe - no debug info, the original icon, DEPS' LGPL FFmpeg).
-VERSION  := 0.1.2
+VERSION  := 0.1.3
 RELEASE  ?=
 DEPS     ?=
 

@@ -1409,6 +1409,8 @@ static void begin_pass(void) {
                 t0 ? t0->height : 0, t0 ? t0->width * dsx : 0, t0 ? t0->height * dsy : 0, t0 ? t0->format : 0,
                 st.rt.depth ? "yes" : "no");
     }
+    extern void vk_pass_scale_match(NvnTexture *const *color, int ncolor, NvnTexture *depth);  // (textures.c)
+    vk_pass_scale_match(st.rt.color, st.rt.ncolor, st.rt.depth);  // one scale for all the attachments
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     pass_ncolor = (uint32_t)st.rt.ncolor;

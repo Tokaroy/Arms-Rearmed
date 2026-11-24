@@ -195,11 +195,14 @@ void renderer_texture_fraction(NvnTexture *t, float *fx, float *fy) {
 }
 uint64_t renderer_present_count(void);
 
-// The game's ambient occlusion stays at the Switch's size (issue #356): see metal.m tex_guest_sized_ao.
+// Guest-sized R8 / small D24S8 targets (another game's ambient occlusion, issue #356: see metal.m tex_guest_sized_ao):
+// off in ARMS. Its fights draw the scene into a colour target and an R8 one together; with the R8 one left at the
+// Switch's size the pass was clipped to it, so at 2x / 3x only the top-left half / third of the scene was drawn and the
+// rest of the picture went dark. LARECOMP_AO_GUEST_SIZE=1: the old rule (A/B).
 static bool tex_guest_sized_ao(const NvnTexture *t) {
-    static int off = -1;
-    if (off < 0) off = getenv("LARECOMP_AO_SCALED") != NULL;
-    if (off) return false;
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_AO_GUEST_SIZE") != NULL;
+    if (!on) return false;
     return t->format == 0x1 || (t->format == 0x35 && t->width <= 480);  // R8 unorm / D24S8, 16:9 (checked by the caller)
 }
 
@@ -589,6 +592,43 @@ static TexBackend *tex_backend(NvnTexture *t) {
         g_share[g_share_n++] = b;
     }
     return b;
+}
+
+// A pass's attachments must share one scale: Vulkan draws a pass only where all its attachments are, so one left at the
+// Switch's size clips the pass to the top-left part of the scaled ones. ARMS's fights draw the scene into a colour
+// target and an R8 one together, and makes the R8 one without NVN's COMPRESSIBLE flag (tex_scalable's sign of a render
+// target): at 2x only the top-left half of the scene was drawn, at 3x a third, and the rest of the picture went dark.
+// An unscaled single-sample 2D attachment the game's size of a scaled one in the same pass becomes scalable here (a
+// fresh image at the render scale - what it held so far is dropped - and scaled from then on, like the others).
+// LARECOMP_VK_NO_RT_MATCH=1: off (A/B).
+void vk_pass_scale_match(NvnTexture *const *color, int ncolor, NvnTexture *depth) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_VK_NO_RT_MATCH") != NULL || getenv("LARECOMP_NO_SCALE") != NULL;
+    if (off) return;
+    NvnTexture *all[9];
+    int n = 0;
+    for (int i = 0; i < ncolor && i < 8; i++)
+        if (color[i]) all[n++] = color[i];
+    if (depth) all[n++] = depth;
+    if (n < 2) return;
+    for (int i = 0; i < n; i++) tex_backend(all[i]);
+    for (int i = 0; i < n; i++) {
+        TexBackend *b = all[i]->backend;
+        if (!b || b->scalable || all[i]->target != 1 || all[i]->samples > 1) continue;
+        bool match = false;
+        for (int j = 0; j < n && !match; j++) {
+            const TexBackend *o = all[j]->backend;
+            match = j != i && o && o->scalable && all[j]->width == all[i]->width && all[j]->height == all[i]->height;
+        }
+        if (!match) continue;
+        static int nlog;
+        if (nlog++ < 20)
+            LOG("[vk] render target %ux%u fmt %#x (flags %#x) drawn with scaled ones of its size: scaled too\n",
+                all[i]->width, all[i]->height, all[i]->format, (unsigned)all[i]->flags);
+        b->scalable = true;
+        destroy_image(b);
+        create_image(all[i], b);
+    }
 }
 
 void backend_texture_destroyed(NvnTexture *t) {

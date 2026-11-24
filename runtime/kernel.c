@@ -770,10 +770,10 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     if (trace_svc < 0) trace_svc = getenv("LARECOMP_TRACE_SVC") != NULL;
     if (!trace_svc) return svc_impl(c, imm, pc);
-    uint64_t in[4] = {c->x[0], c->x[1], c->x[2], c->x[3]};
+    uint64_t in[4] = {c->x[0], c->x[1], c->x[2], c->x[3]}, t0 = plat_now_ns();
     svc_impl(c, imm, pc);
-    LOG("[svc] %02x(%llx, %llx, %llx, %llx) -> %llx %llx %llx  @%llx\n", imm, in[0], in[1], in[2], in[3], c->x[0],
-        c->x[1], c->x[2], pc);
+    LOG("[svc] %02x(%llx, %llx, %llx, %llx) -> %llx %llx %llx  @%llx thread %x %.2f ms (at %.1f)\n", imm, in[0], in[1], in[2],
+        in[3], c->x[0], c->x[1], c->x[2], pc, t_cur ? t_cur->handle : 0, (plat_now_ns() - t0) / 1e6, t0 / 1e6);
 }
 
 static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {

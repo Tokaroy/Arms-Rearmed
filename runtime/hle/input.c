@@ -1104,18 +1104,6 @@ static void fill_state(Cpu *c) {
         } else if (f > tap_frame) tap = 0;
     }
     uint64_t b = menu ? script_buttons : held | tap | script_buttons;
-    {   // Skip the title screen (setting): L + R held from the start as a player holding them would - the title screen
-        // takes them and goes to the main menu, whose buttons act on presses only (held from before, nothing happens).
-        // The safety screen before the title is timed: it stays. The player's own first press, or 30 s, ends it.
-        static int skip = -1;  // (-1: not decided yet, 1: holding, 0: done)
-        extern uint64_t renderer_present_count(void);
-        if (skip < 0) skip = g_settings.skip_title ? 1 : 0;
-        if (skip == 1 && (held || renderer_present_count() > 1800)) {
-            skip = 0;
-            LOG("[input] skip the title: L + R released (%s)\n", held ? "the player pressed something" : "30 s");
-        }
-        if (skip == 1 && !menu) b |= 1ull << BTN_L | 1ull << BTN_R;
-    }
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;

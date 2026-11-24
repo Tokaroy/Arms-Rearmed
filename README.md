@@ -91,9 +91,6 @@ controller short, the keyboard is player 1 and the controllers are players 2 on.
 number light it. The in-game menu's Controls tab lists who plays with what under **Players**: select a player to
 give them the next controller (it swaps with whoever had it), and **Identify controllers** makes each one vibrate.
 
-**Skip the title screen** (launcher PLAY page, or the in-game Video tab): straight to the main menu after the safety
-screen at start, without pressing L + R.
-
 ## Making a release
 
 From the MSYS2 UCRT64 shell (with `nasm` and `zip` installed as well): `make deps-windows` (an LGPL-only FFmpeg),

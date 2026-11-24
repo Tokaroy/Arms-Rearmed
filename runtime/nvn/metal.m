@@ -239,11 +239,12 @@ void renderer_set_alloc_scale(float ax, float ay) { g_al_x = ax; g_al_y = ay; }
 // same one (bands of dark AO on flat ground that crawl as the camera moves: the "haze"), above 1 the pattern grows
 // past the game's 4x4 blur and is left as dither. At the guest size it is the Switch's AO at any resolution, and
 // cheap (a quarter of 1080p). The depth-stencil goes with it: Metal / Vulkan draw a pass only where all its
-// attachments are. LARECOMP_AO_SCALED=1 (A/B): scaled like the rest again.
+// attachments are. Off in ARMS (vulkan/textures.c says why: its fight scene pass draws into an R8 target alongside the
+// colour one); LARECOMP_AO_GUEST_SIZE=1: on again (A/B).
 static bool tex_guest_sized_ao(const NvnTexture *t) {
-    static int off = -1;
-    if (off < 0) off = getenv("LARECOMP_AO_SCALED") != NULL;
-    if (off) return false;
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_AO_GUEST_SIZE") != NULL;
+    if (!on) return false;
     return t->format == 0x1 || (t->format == 0x35 && t->width <= 480);  // R8 unorm / D24S8, 16:9 (checked by the caller)
 }
 

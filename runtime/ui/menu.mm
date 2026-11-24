@@ -512,12 +512,7 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
-
-    opt_section("Game");
-    // (Link's Awakening's "Remove blur" and "Hide Hero Mode icon" were here: nothing in ARMS)
-    opt_toggle("Skip the title screen", &g_settings.skip_title, false,
-               "Goes straight to the main menu after the safety screen at start, without pressing L + R. Pressing "
-               "anything before then shows the title as usual.");
+    // (Link's Awakening's "Remove blur" and "Hide Hero Mode icon" were a "Game" section here: nothing in ARMS)
     opt_end();
 }
 

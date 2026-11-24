@@ -91,8 +91,7 @@
         "show_fps": "0",
         "volume": "1.00",
         "rumble": "1",
-        "background_input": "0",
-        "skip_title": "0"
+        "background_input": "0"
       }
     }
   ],
@@ -348,29 +347,6 @@
       ],
       "defaults": {
         "background_input": "0"
-      }
-    },
-    {
-      "id": "skip_title",
-      "label": "Skip the title screen",
-      "group": "Game",
-      "help": "Straight to the main menu after the safety screen, without pressing L + R.",
-      "choices": [
-        {
-          "label": "Off",
-          "set": {
-            "skip_title": "0"
-          }
-        },
-        {
-          "label": "On",
-          "set": {
-            "skip_title": "1"
-          }
-        }
-      ],
-      "defaults": {
-        "skip_title": "0"
       }
     }
   ],

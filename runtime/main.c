@@ -225,6 +225,7 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    { extern void sampler_start(void); sampler_start(); }  // (LARECOMP_SAMPLE: runtime/sampler.c)
 #ifdef _WIN32
     // The release's armsrecomp.exe opened before the game was set up (the game's code not extracted or not built):
     // the launcher next to it instead, which sets the game up, rather than a "missing exefs/main" error

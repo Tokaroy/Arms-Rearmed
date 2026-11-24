@@ -230,7 +230,33 @@ address table of its own.
   with screenshots) did not happen here: minimise / restore at 1x, 2x and in a 3840x2160 window, with and without
   SMAA, and window size changes in fights, character select and Training all drew correctly. The log now has
   `[window]` lines (minimised, restored, sizes) and one line for a stretch of failed acquires instead of one per frame;
-  test scripts can `window:minimize` / `window:restore`.
+  test scripts can `window:minimize` / `window:restore`. (It was the 2x bug below: Match display at 4K is 2x.)
+
+## 2x / 3x fights; Skip the title screen removed (2026-11-23, the same player's report)
+
+- **Fights at 2x / 3x drew the scene into the top-left half / third**, the rest dark (silhouettes, the HUD at full
+  size); 1x was fine, menus too. The fight's scene pass draws into a colour target and an R8 one together (the
+  game's size: 1310x737, 1120x630... its own dynamic resolution), and the game makes the R8 one without NVN's
+  COMPRESSIBLE flag - `tex_scalable`'s sign of a render target - so it stayed at the Switch's size while the colour
+  and depth targets were scaled. A Vulkan pass covers only where all its attachments are: it was clipped to the
+  unscaled one. `vk_pass_scale_match` (`runtime/nvn/vulkan/textures.c`, called as each pass begins in `exec.c`): an
+  unscaled single-sample 2D attachment of the same game size as a scaled one in the pass becomes scalable (a new
+  image; `LARECOMP_VK_NO_RT_MATCH=1`: off). Also off now: the guest-sized "ambient occlusion" rule inherited from
+  LAS Recomp (R8 / small D24S8 targets never scaled; `LARECOMP_AO_GUEST_SIZE=1` brings it back). Found with
+  `LARECOMP_DEBUG_FRAME` at 3x (`pass 1310x737 s 3.0` with a 3930x2211 viewport); checked: 1P Versus at 3x and a
+  2P split-screen Versus at 2x drawn whole at 60 fps.
+- **Skip the title screen is gone** (setting, launcher checkbox, Video tab row, RecompLauncher setting; a
+  `skip_title` line left in larecomp.ini is ignored). It didn't work for the player, who wanted the intro before
+  the title skipped (the thumbs-up safety screen and the ARMS logo), and the owner decided against the option.
+  What was found, for later: the start is paced by the **audio renderer**. What the game loads behind the safety
+  screen goes at the renderer's 5 ms frames: the system tick 8x (`LARECOMP_TICK_SCALE`), uncapped frames, a 240 Hz
+  vsync, sleeps and wait timeouts divided by 8, core exclusion off and a native Yaz0 decompressor all left it at
+  ~6 s; the renderer at 8x (silent) took it to ~1 s and the main menu from ~frame 500 to ~240. The ARMS logo after
+  it (~3 s) is neither audio- nor frame-paced. The game keeps loading fighters in the background until ~frame 470.
+- **Diagnostics**: `LARECOMP_SAMPLE=<from s>:<to s>` (`runtime/sampler.c`, Windows): a sampling profiler, per thread
+  and per address, into build/samples.txt (game code: `nm -n build/armsgame.dll`, f_<guest address>). At the start,
+  the hot game code is the Yaz0 decompression and a resource lookup by name (a linked list, names compared byte by
+  byte). `LARECOMP_TRACE_SVC=1` lines now have the thread, the call's duration and the time.
 
 What this project changed relative to [LAS Recomp](https://github.com/peiikai/LASRecomp) (its recompiler and Switch
 runtime), why, and where. It also lists the debugging switches, the test routes, the known gaps and the next steps.
